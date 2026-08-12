@@ -1,0 +1,2 @@
+# Mesh processing and plane intersection
+trimesh>=4.0.0

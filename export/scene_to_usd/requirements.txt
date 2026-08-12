@@ -1,0 +1,2 @@
+# Pixar USD file format support
+usd-core>=23.11

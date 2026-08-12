@@ -1,0 +1,2 @@
+# Background removal for sprite mode
+rembg>=2.0.0

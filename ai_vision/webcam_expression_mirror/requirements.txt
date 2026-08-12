@@ -1,0 +1,8 @@
+# Facial landmark detection
+mediapipe>=0.10.0
+
+# Image and video processing
+opencv-python>=4.8.0
+
+# Numerical operations
+numpy>=1.24.0
