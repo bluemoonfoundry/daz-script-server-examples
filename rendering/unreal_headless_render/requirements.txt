@@ -1,0 +1,4 @@
+# dazpy's own HTTP client dependency; only needed if dazpy is not already
+# installed (`pip install -e .` from the daz-script-server repo root pulls
+# this in automatically via dazpy's own install_requires).
+requests>=2.28
