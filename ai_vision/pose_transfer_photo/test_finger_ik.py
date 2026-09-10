@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
+import pytest
+
 import finger_ik as fik
 
 
@@ -50,3 +53,30 @@ def test_index_chain_landmarks_match_known_indices():
 def test_thumb_chain_landmarks_match_known_indices():
     d = fik.DIGIT_CHAINS["r_thumb"]
     assert (d.target1_landmark, d.target2_landmark, d.tip_landmark) == (2, 3, 4)
+
+
+@pytest.mark.parametrize("axis,in_plane_indices", [("x", (1, 2)), ("y", (2, 0)), ("z", (0, 1))])
+@pytest.mark.parametrize("angle_deg", [0.0, 30.0, -45.0, 90.0, -170.0])
+def test_hinge_angle_from_vectors_recovers_known_rotation(axis, in_plane_indices, angle_deg):
+    # Build v_in as a unit vector in the plane perpendicular to `axis`, and
+    # v_out as v_in rotated by angle_deg about `axis` using pinocchio_ik's
+    # own axis-rotation matrix -- so this test is validating against the
+    # exact same rotation convention the rest of the codebase uses.
+    import pinocchio_ik as pik
+
+    v_in = np.zeros(3)
+    i, j = in_plane_indices
+    v_in[i] = 1.0
+    R = pik._axis_rotation(axis.upper(), angle_deg)
+    v_out = R @ v_in
+
+    recovered = fik.hinge_angle_from_vectors(v_in, v_out, axis)
+    assert recovered == pytest.approx(angle_deg, abs=1e-6)
+
+
+def test_hinge_angle_from_vectors_ignores_component_along_axis():
+    # A component along the hinge axis itself shouldn't affect the recovered
+    # angle -- only the projection onto the perpendicular plane matters.
+    v_in = np.array([1.0, 0.0, 5.0])
+    v_out = np.array([0.0, 1.0, -3.0])  # v_in's xy-part (1,0) rotated +90 deg about z
+    assert fik.hinge_angle_from_vectors(v_in, v_out, "z") == pytest.approx(90.0, abs=1e-6)

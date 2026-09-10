@@ -76,3 +76,18 @@ for _side in ("l", "r"):
     DIGIT_CHAINS[f"{_side}_pinky"] = _finger_chain(_side, "pinky", PINKY_MCP)
     DIGIT_CHAINS[f"{_side}_thumb"] = _thumb_chain(_side)
 del _side
+
+
+_AXIS_PLANE_INDICES = {"x": (1, 2), "y": (2, 0), "z": (0, 1)}
+
+
+def hinge_angle_from_vectors(v_in: np.ndarray, v_out: np.ndarray, axis: str) -> float:
+    """Signed angle (degrees) about `axis` that rotates `v_in` toward `v_out`,
+    ignoring any component along `axis` itself. Matches the right-hand-rule
+    sign convention of `pinocchio_ik._axis_rotation` -- verified directly
+    against it in `test_hinge_angle_from_vectors_recovers_known_rotation`.
+    """
+    i, j = _AXIS_PLANE_INDICES[axis]
+    cross = v_in[i] * v_out[j] - v_in[j] * v_out[i]
+    dot = v_in[i] * v_out[i] + v_in[j] * v_out[j]
+    return float(np.degrees(np.arctan2(cross, dot)))
