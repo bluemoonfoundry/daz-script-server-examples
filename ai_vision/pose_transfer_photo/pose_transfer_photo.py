@@ -563,6 +563,9 @@ if __name__ == "__main__":
                         help="Skip wrist targets")
     parser.add_argument("--no-feet", dest="feet", action="store_false",
                         help="Skip ankle targets")
+    parser.add_argument("--fingers", action="store_true",
+                        help="Also pose fingers from the same photo via MediaPipe HandLandmarker "
+                             "(requires --backend pinocchio and wrist targets enabled)")
     parser.add_argument("--max-iterations", type=int, default=150,
                         help="Max stacked-IK iterations for the whole simultaneous solve "
                              "(default: 150 — this is a real numerical solve, not a quick "
@@ -580,6 +583,13 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true",
                         help="Print per-iteration convergence diagnostics")
     args = parser.parse_args()
+
+    if args.fingers and args.backend != "pinocchio":
+        sys.exit("--fingers requires --backend pinocchio (per-finger IK is too slow over the "
+                  "HTTP stacked backend -- see finger_ik.py's module docstring).")
+    if args.fingers and not args.hands:
+        sys.exit("--fingers requires wrist targets to be enabled (fingers are anchored to the "
+                  "solved wrist position) -- remove --no-hands.")
 
     scene = DazScene()
     client = DazClient()
@@ -661,5 +671,70 @@ if __name__ == "__main__":
     for name in effector_names:
         status = "OK" if final_error[name] <= args.tolerance else "NOT CONVERGED"
         print(f"  {name:10s} {final_error[name]:.3f}   [{status}]")
+
+    if args.fingers:
+        import finger_ik as fik
+        from hand_landmarks import extract_hand_world_landmarks
+
+        print("\nExtracting hand landmarks for finger posing...")
+        detected_hands = extract_hand_world_landmarks(args.image)
+
+        # Re-read bone_metadata() *after* the body IK solve above -- l_hand/
+        # r_hand's world_position now reflects the solved wrist, not the
+        # pre-solve rest pose captured in `by_name`. Every digit lookup below
+        # must go through this fresh snapshot, not the stale `by_name`.
+        post_solve_meta = {b["name"]: b for b in figure.bone_metadata()}
+
+        def _post_world(name: str) -> tuple[float, float, float]:
+            w = post_solve_meta[name]["world_position"]
+            return (w["x"], w["y"], w["z"])
+
+        finger_errors: dict[str, dict[str, float]] = {}
+        all_solved_angles: dict[str, tuple[float, float, float]] = {}
+
+        side_by_label = {"Left": "l", "Right": "r"}
+        for hand_label, side in side_by_label.items():
+            if hand_label not in detected_hands:
+                print(f"  {hand_label} hand: SKIPPED (not detected)")
+                continue
+
+            wrist_bone = f"{side}_hand"
+            wrist_world = _post_world(wrist_bone)
+            anchored = fik.anchor_hand_landmarks(
+                detected_hands[hand_label], mp_hip_mid, daz_hip_world, unit_scale, wrist_world,
+            )
+
+            for digit_name in ("index", "mid", "ring", "pinky", "thumb"):
+                digit = fik.DIGIT_CHAINS[f"{side}_{digit_name}"]
+                fm = fik.pik.build_figure_model(list(post_solve_meta.values()), digit.chain_bones)
+                current_rot = figure.bone_rotations()
+                initial_angles = {
+                    b: {"x": current_rot[b][0], "y": current_rot[b][1], "z": current_rot[b][2]}
+                    for b in digit.chain_bones
+                }
+                solved, err = fik.solve_digit_chain(
+                    fm, digit,
+                    target1_point=np.array(anchored[digit.target1_landmark]),
+                    target2_point=np.array(anchored[digit.target2_landmark]),
+                    tip_point=np.array(anchored[digit.tip_landmark]),
+                    initial_angles=initial_angles,
+                    max_iterations=args.max_iterations, tolerance=args.tolerance,
+                    damping=args.damping, rest_pose_weight=args.rest_pose_weight,
+                    max_step_degrees=args.step_degrees, debug=args.debug,
+                )
+                finger_errors[f"{side}_{digit_name}"] = err
+                for bone, a in solved.items():
+                    all_solved_angles[bone] = (a["x"], a["y"], a["z"])
+
+        if all_solved_angles:
+            with scene.undo("Apply photo finger pose"):
+                figure.set_bone_rotations(all_solved_angles)
+
+        if finger_errors:
+            print("\nFinal per-digit error (scene units):")
+            for name, err in finger_errors.items():
+                worst = max(err.values())
+                status = "OK" if worst <= args.tolerance else "NOT CONVERGED"
+                print(f"  {name:10s} {worst:.3f}   [{status}]")
 
     print(f"\nDone. Applied {len(effector_names)} limb targets to {args.figure!r}.")
