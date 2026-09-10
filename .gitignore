@@ -59,3 +59,4 @@ Thumbs.db
 
 # Auto-downloaded MediaPipe model files (fetched on first run by _ensure_model())
 *.task
+.superpowers/
