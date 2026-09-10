@@ -14,6 +14,7 @@ import numpy as np
 import pinocchio as pin
 
 import pinocchio_ik as pik
+from pose_transfer_photo import to_daz_world
 
 # MediaPipe HandLandmarker's 21 landmarks, standard indices.
 WRIST = 0
@@ -130,3 +131,26 @@ def solve_digit_chain(
     solved_angles[digit.chain_bones[-1]][digit.tip_hinge_axis] = theta
     solved_angles = pik.clamp_angles(fm, solved_angles)
     return solved_angles, final_error
+
+
+def anchor_hand_landmarks(
+    hand_landmarks: list[tuple[float, float, float]],
+    mp_hip_mid: tuple[float, float, float],
+    daz_hip_world: tuple[float, float, float],
+    unit_scale: float,
+    wrist_world: tuple[float, float, float],
+) -> list[np.ndarray]:
+    """Apply the body pipeline's existing scale+rotation transform to a
+    hand's 21 landmarks, then translate the whole set so its own wrist
+    landmark lands exactly on `wrist_world` (the already-solved l_hand/
+    r_hand world position). Per the design spec: this assumes MediaPipe's
+    Pose and Hand world-landmark tasks share a rotational axis convention
+    (verified live in Task 6, not re-derived here) -- a pure translation,
+    no separate rotation estimate.
+    """
+    transformed = [
+        np.array(to_daz_world(lm, mp_hip_mid, daz_hip_world, unit_scale))
+        for lm in hand_landmarks
+    ]
+    offset = np.array(wrist_world) - transformed[0]
+    return [p + offset for p in transformed]

@@ -5,6 +5,7 @@ import pytest
 
 import finger_ik as fik
 import pinocchio_ik as pik
+from pose_transfer_photo import to_daz_world
 
 
 def test_digit_chains_cover_both_hands_and_all_five_digits():
@@ -145,3 +146,31 @@ def test_solve_digit_chain_recovers_known_tip_hinge_angle():
     assert solved["hinge3"]["z"] == pytest.approx(true_angles["hinge3"]["z"], abs=1.0)
     assert solved["hinge3"]["x"] == pytest.approx(0.0, abs=1e-6)
     assert solved["hinge3"]["y"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_anchor_hand_landmarks_places_wrist_exactly_at_given_position():
+    hand_landmarks = [(0.0, 0.0, 0.0), (0.02, -0.01, 0.0), (0.04, -0.02, 0.0)]  # fake, only need [0]
+    mp_hip_mid = (0.1, 0.2, 0.3)
+    daz_hip_world = (5.0, 90.0, -2.0)
+    unit_scale = 100.0
+    wrist_world = (10.0, 95.0, 3.0)
+
+    anchored = fik.anchor_hand_landmarks(hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world)
+
+    np.testing.assert_allclose(anchored[0], np.array(wrist_world), atol=1e-9)
+    assert len(anchored) == 3
+
+
+def test_anchor_hand_landmarks_preserves_relative_scaled_offsets():
+    hand_landmarks = [(0.0, 0.0, 0.0), (0.02, 0.0, 0.0)]
+    mp_hip_mid = (0.0, 0.0, 0.0)
+    daz_hip_world = (0.0, 0.0, 0.0)
+    unit_scale = 100.0
+    wrist_world = (0.0, 0.0, 0.0)
+
+    anchored = fik.anchor_hand_landmarks(hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world)
+
+    # landmark[1] is +0.02 in x relative to landmark[0] (the wrist) in
+    # MediaPipe space; to_daz_world's x sign is unflipped and unit_scale=100
+    # -> expect +2.0 in DAZ x relative to the anchored wrist.
+    np.testing.assert_allclose(anchored[1] - anchored[0], np.array([2.0, 0.0, 0.0]), atol=1e-9)
