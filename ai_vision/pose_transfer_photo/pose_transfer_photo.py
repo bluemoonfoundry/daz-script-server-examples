@@ -95,6 +95,12 @@ Usage:
     python pose_transfer_photo.py photo.jpg --scale 1.2
     python pose_transfer_photo.py photo.jpg --no-feet
     python pose_transfer_photo.py photo.jpg --max-iterations 150 --damping 0.1 --debug
+
+    # --backend pinocchio: local IK solve, zero HTTP round-trips per iteration
+    # (see pinocchio_ik.py for setup -- requires a conda-forge Pinocchio env,
+    # not the default venv). Worthwhile once processing many photos x many
+    # figures; the model build cost per unique figure is then amortized.
+    python pose_transfer_photo.py photo.jpg --backend pinocchio
 """
 
 from __future__ import annotations
@@ -484,6 +490,56 @@ def solve_stacked_ik(
     return final_error
 
 
+def solve_pinocchio_ik(
+    figure,
+    figure_label: str,
+    effector_names: list[str],
+    target_points: list[tuple[float, float, float]],
+    *,
+    max_iterations: int = 300,
+    tolerance: float = 0.15,
+    damping: float = 0.2,
+    rest_pose_weight: float = 0.15,
+    max_step_degrees: float = 2.0,
+    debug: bool = False,
+) -> dict[str, float]:
+    """Same contract as `solve_stacked_ik`, but the entire iterative solve runs
+    locally against a Pinocchio kinematic model (see `pinocchio_ik.py`) --
+    zero HTTP round-trips inside the loop, one `set_bone_rotations()` call at
+    the end. Requires a real Pinocchio install (see `pinocchio_ik.py`'s module
+    docstring for the Windows conda-forge setup; there is no usable PyPI wheel).
+    """
+    import pinocchio_ik as pik
+
+    union_chain: list[str] = []
+    for name in effector_names:
+        for bone in _CHAINS[name]:
+            if bone not in union_chain:
+                union_chain.append(bone)
+        if name not in union_chain:
+            union_chain.append(name)  # effector itself is a pure position marker in the model
+
+    meta = figure.bone_metadata()
+    fm = pik.build_figure_model(meta, union_chain)
+
+    current_rot = figure.bone_rotations()
+    initial_angles = {
+        name: {"x": current_rot[name][0], "y": current_rot[name][1], "z": current_rot[name][2]}
+        for name in union_chain
+    }
+
+    solved_angles, final_error = pik.solve_ik(
+        fm, effector_names, np.array(target_points, dtype=float),
+        initial_angles=initial_angles,
+        max_iterations=max_iterations, tolerance=tolerance, damping=damping,
+        rest_pose_weight=rest_pose_weight, max_step_degrees=max_step_degrees,
+        debug=debug,
+    )
+
+    figure.set_bone_rotations({name: (a["x"], a["y"], a["z"]) for name, a in solved_angles.items()})
+    return final_error
+
+
 if __name__ == "__main__":
     # ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -494,6 +550,13 @@ if __name__ == "__main__":
     parser.add_argument("image", help="Path to source image")
     parser.add_argument("--figure", default="Jason Cross",
                         help="DAZ figure label (default: 'Jason Cross')")
+    parser.add_argument("--backend", choices=["stacked", "pinocchio"], default="stacked",
+                        help="'stacked' (default): original HTTP finite-difference solver, "
+                             "one round-trip per iteration. 'pinocchio': local kinematic model "
+                             "(see pinocchio_ik.py), zero round-trips during iteration, one "
+                             "set_bone_rotations() push at the end -- requires a real Pinocchio "
+                             "install (conda-forge on Windows; see pinocchio_ik.py docstring) "
+                             "and a separate Python environment from mediapipe/opencv.")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Extra multiplier on top of auto-calibrated scale (default: 1.0)")
     parser.add_argument("--no-hands", dest="hands", action="store_false",
@@ -576,14 +639,23 @@ if __name__ == "__main__":
     for name, point in zip(effector_names, target_points):
         print(f"  {name:10s} target -> {point[0]:+7.2f}, {point[1]:+7.2f}, {point[2]:+7.2f}")
 
-    print(f"\nSolving {len(effector_names)} limb targets on {args.figure!r} simultaneously...")
+    print(f"\nSolving {len(effector_names)} limb targets on {args.figure!r} simultaneously "
+          f"(backend={args.backend!r})...")
     with scene.undo("Apply photo pose"):
-        final_error = solve_stacked_ik(
-            client, figure, args.figure, effector_names, target_points,
-            max_iterations=args.max_iterations, tolerance=args.tolerance,
-            step_degrees=args.step_degrees, damping=args.damping,
-            rest_pose_weight=args.rest_pose_weight, debug=args.debug,
-        )
+        if args.backend == "pinocchio":
+            final_error = solve_pinocchio_ik(
+                figure, args.figure, effector_names, target_points,
+                max_iterations=args.max_iterations, tolerance=args.tolerance,
+                damping=args.damping, rest_pose_weight=args.rest_pose_weight,
+                max_step_degrees=args.step_degrees, debug=args.debug,
+            )
+        else:
+            final_error = solve_stacked_ik(
+                client, figure, args.figure, effector_names, target_points,
+                max_iterations=args.max_iterations, tolerance=args.tolerance,
+                step_degrees=args.step_degrees, damping=args.damping,
+                rest_pose_weight=args.rest_pose_weight, debug=args.debug,
+            )
 
     print("\nFinal per-limb error (scene units):")
     for name in effector_names:
