@@ -5,20 +5,39 @@ PURPOSE
 This script is a demonstration of what the DAZ Studio Script Server makes
 possible.  It extracts 33 body landmarks from a source image using MediaPipe
 PoseLandmarker, converts the wrist/ankle landmarks into DAZ Studio world-space
-targets, and drives the figure's hands and feet toward those targets using the
-IK aligner already built into dazpy (`DazSkeleton.hand_to_target` /
-`.foot_to_target`, the same solver `ik_bone_to_target.py` exercises directly).
+targets, and drives the figure's hands and feet toward those targets using a
+custom multi-effector IK solve: one combined raw-DazScript call per iteration
+(see `fundamentals/raw_script/` for the underlying pattern) perturbs every
+bone across all four limb chains and reads back all four effector positions
+in a single round trip, giving a full stacked Jacobian with cross-limb
+coupling included; numpy then solves one damped-least-squares step for all
+four targets *simultaneously*, with a null-space secondary objective that
+biases unconstrained joints back toward the figure's starting pose.
 
 It is an *example*, not a full-body motion-capture tool.  Only the four limb
 effectors (both wrists, both ankles) are driven — elbows/knees follow from the
-IK chain solve rather than being matched to the photo directly.  Torso/head
-aren't independently targeted, but the hand chains share `spine4` and the foot
-chains share `hip`/`pelvis`, so solving one limb can visibly tilt the spine or
-hips as a side effect (the head, undriven, inherits that tilt).  A real system
-would solve pelvis/spine orientation explicitly and account for camera
-perspective.  The goal here is to show that the script server's existing IK
-aligner can be driven from arbitrary Python vision output, not just from the
-interaction-recipe / hardcoded-target call sites shown elsewhere in this repo.
+IK chain solve rather than being matched to the photo directly.  Torso and
+head are never touched at all: the chains are deliberately rooted below the
+shared `spine4`/`hip` bones (see `_CHAINS` below), so a target beyond the
+remaining chain's reach reports NOT CONVERGED instead of quietly recruiting
+the spine to compensate.  A real system would solve pelvis/spine orientation
+explicitly and account for camera perspective.
+
+An earlier version of this script called dazpy's own single-effector
+`DazSkeleton.hand_to_target()`/`.foot_to_target()` once per limb, in
+sequence — the same solver `ik_bone_to_target.py` exercises directly.  Their
+auto-selected chains include `spine4` (shared by both hands) and `hip`
+(shared by both feet, and in fact the skeleton's actual root), so each
+limb's solve could disturb a root bone a previously-solved limb depended on,
+and worse, a foot-reach solve rotating `hip` tipped the *entire* body —
+torso, arms, head included — to gain a little extra leg reach. A
+"relaxation passes" workaround (re-solving every limb 2-3 times) reduced the
+first problem but not the second, and neither is fixable by iterating harder
+since it's the chain composition itself, not the solver, doing the damage.
+This version fixes both by construction: solving all four limbs jointly
+removes the "previous limb" problem, and rooting the leg chains at `pelvis`
+(a sibling of `spine1`, not its ancestor) instead of `hip` means a leg-reach
+solve can no longer touch the spine at all.
 
 IMPORTANT: reset the figure to a neutral pose (e.g. `dazpy.poses.zero_figure`,
 or DAZ Studio's own Zero Pose) before each run.  Calibration reads the
@@ -33,15 +52,18 @@ WHAT IT DEMONSTRATES
   - Auto-calibrating scale and origin from the live figure's own shoulder width
     and hip position, so results roughly work across different figure heights
     without manual tuning
-  - Reusing DazSkeleton.hand_to_target()/.foot_to_target() — the same
-    damped-least-squares IK aligner used by character/ik_bone_to_target.py —
-    to drive both wrists and both ankles toward photo-derived world points
-  - Running multiple relaxation passes over all four limbs, since the hand
-    chains share spine4 and the foot chains share hip/pelvis — solving one
-    limb can disturb a root bone another limb already converged against
+  - Solving all four limb targets simultaneously with a stacked-Jacobian
+    damped-least-squares IK step (one combined raw-DazScript call per
+    iteration computes the full cross-limb coupling in a single round trip;
+    numpy solves the linear system in Python)
+  - Choosing IK chain composition deliberately (excluding shared root bones)
+    rather than just tuning solver parameters, when a shared root lets the
+    solver "cheat" toward a lower position error at the cost of a wrong pose
+  - A null-space secondary objective (rest-pose bias) that keeps DOFs the
+    primary task doesn't need close to the starting pose instead of drifting
   - Wrapping the whole pose application in one named undo step
     (scene.undo(...)) so Ctrl+Z in DAZ Studio undoes it in a single step
-  - Reporting per-limb IK convergence (iterations, final error) for debugging
+  - Reporting per-iteration IK convergence for all four effectors at once
 
 ENVIRONMENT SETUP
 -----------------
@@ -72,12 +94,13 @@ Usage:
     python pose_transfer_photo.py photo.jpg --figure "Jason Cross"
     python pose_transfer_photo.py photo.jpg --scale 1.2
     python pose_transfer_photo.py photo.jpg --no-feet
-    python pose_transfer_photo.py photo.jpg --debug
+    python pose_transfer_photo.py photo.jpg --max-iterations 150 --damping 0.1 --debug
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -87,7 +110,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from dazpy import DazScene
+from dazpy import DazClient, DazScene
 from dazpy.exceptions import DazBusyError
 
 # Plausible real-world shoulder width range (meters) used to sanity-check
@@ -233,12 +256,9 @@ def to_daz_world(
 
 
 # ── busy-retry helper ──────────────────────────────────────────────────────────
-# hand_to_target()/foot_to_target() rebuild a fresh rig profile (bone_metadata())
-# on every call with no built-in retry, and each call itself fires up to
-# max_iterations rapid HTTP round-trips. Four limbs back-to-back in one
-# scene.undo() block can catch DAZ Studio's main thread still catching up from
-# the previous limb's burst, raising StudioBusyError. Retry here instead of
-# crashing the whole pose application over one transient hiccup.
+# A burst of rapid HTTP calls (one stacked-Jacobian solve per iteration) can
+# catch DAZ Studio's main thread still finishing the previous call. Retry here
+# instead of crashing the whole pose application over one transient hiccup.
 
 def _call_with_busy_retry(fn, *, retries: int = 5, base_delay: float = 1.5):
     for attempt in range(retries):
@@ -250,6 +270,218 @@ def _call_with_busy_retry(fn, *, retries: int = 5, base_delay: float = 1.5):
             wait = min(base_delay * (attempt + 1), 8.0)
             print(f"    (DAZ Studio busy, retrying in {wait:.1f}s...)")
             time.sleep(wait)
+
+
+# ── stacked-Jacobian multi-effector IK ──────────────────────────────────────────
+# Genesis 9 IK chains per limb (root -> effector's parent). These match what
+# dazpy's own single-limb aligner resolves via FigureRigProfile.suggest_primary_chain()
+# (see character/ik_bone_to_target.py --debug output) — hardcoded here (same
+# precedent as bvh/bvh_bone_maps.py's per-generation bone tables) so the chains
+# for all four limbs are known up front and can be merged into one combined
+# perturbation script below.
+
+# spine4 and hip are deliberately excluded from these chains (unlike dazpy's
+# own hand_to_target()/foot_to_target(), whose auto-selected chains include
+# them) — both are shared roots whose rotation reaches far beyond the limb
+# being solved:
+#   - spine4 is the hand chains' only source of extra reach beyond the
+#     forearm, and the solver used that freely: a perfectly converged wrist
+#     position with the whole spine wrenched back to get there.
+#   - hip is worse: it's the skeleton's actual root (parent=None; even
+#     spine1 is its child), so rotating it to help a foot reach farther
+#     rocks the *entire* body — torso, arms, head included. pelvis, by
+#     contrast, is a *sibling* of spine1 (both children of hip) rather than
+#     its ancestor, so a leg chain rooted at pelvis can reach for a foot
+#     target without moving the spine/head at all.
+# Dropping both means a target beyond the remaining chain's reach honestly
+# reports NOT CONVERGED instead of quietly recruiting the torso to compensate
+# — matching the documented "torso/head aren't targeted" scope for real,
+# instead of mostly matching it.
+_CHAINS: dict[str, list[str]] = {
+    "l_hand": ["l_shoulder", "l_upperarm", "l_forearm"],
+    "r_hand": ["r_shoulder", "r_upperarm", "r_forearm"],
+    "l_foot": ["pelvis", "l_thigh", "l_shin"],
+    "r_foot": ["pelvis", "r_thigh", "r_shin"],
+}
+
+
+def _stacked_jacobian_script(
+    figure_label: str, union_chain: list[str], effector_names: list[str], step_degrees: float
+) -> str:
+    """Build one DazScript call that perturbs every bone in `union_chain` (one
+    axis at a time) and reads back all `effector_names` world positions after
+    each perturbation — the server-side half of a stacked multi-effector
+    Jacobian. Mirrors dazpy's own DazSkeleton.evaluate_pose_jacobian()
+    (dazpy/_skeleton.py), generalized from one effector to several so the
+    Python side can see how a bone shared across limb chains (e.g. `pelvis`,
+    shared by both leg chains) affects *every* limb it touches, not just the
+    one limb it happens to be perturbing for.
+    """
+    return f"""(function(){{
+        var _skel=null,_skels=Scene.getSkeletonList();
+        for(var _i=0;_i<_skels.length;_i++){{if(_skels[_i].getLabel()==={json.dumps(figure_label)}){{_skel=_skels[_i];break;}}}}
+        if(!_skel) return null;
+        var _chainNames={json.dumps(union_chain)};
+        var _effNames={json.dumps(effector_names)};
+        var _step={float(step_degrees)};
+        var _all=_skel.getAllBones();
+        var _map={{}};
+        for(var i=0;i<_all.length;i++){{_map[_all[i].getName()]=_all[i];}}
+        var _bones=[]; for(var i=0;i<_chainNames.length;i++){{
+            var b=_map[_chainNames[i]]; if(!b) return {{error: "bone_not_found", name: _chainNames[i]}};
+            _bones.push(b);
+        }}
+        var _effs=[]; for(var i=0;i<_effNames.length;i++){{
+            var e=_map[_effNames[i]]; if(!e) return {{error: "bone_not_found", name: _effNames[i]}};
+            _effs.push(e);
+        }}
+        function _pos(b){{var p=b.getWSPos(); return [p.x,p.y,p.z];}}
+        var _base=[]; for(var e=0;e<_effs.length;e++){{_base.push(_pos(_effs[e]));}}
+        var _columns=[];
+        for(var bi=0; bi<_bones.length; bi++){{
+            var b=_bones[bi];
+            var ctrls=[b.getXRotControl(),b.getYRotControl(),b.getZRotControl()];
+            for(var axis=0; axis<3; axis++){{
+                var ctrl=ctrls[axis];
+                var orig=ctrl.getValue();
+                ctrl.setValue(orig+_step);
+                var col=[];
+                for(var e=0;e<_effs.length;e++){{
+                    var p=_pos(_effs[e]);
+                    col.push((p[0]-_base[e][0])/_step,(p[1]-_base[e][1])/_step,(p[2]-_base[e][2])/_step);
+                }}
+                ctrl.setValue(orig);
+                _columns.push(col);
+            }}
+        }}
+        return {{base: _base, columns: _columns}};
+    }})()"""
+
+
+def solve_stacked_ik(
+    client: DazClient,
+    figure,
+    figure_label: str,
+    effector_names: list[str],
+    target_points: list[tuple[float, float, float]],
+    *,
+    max_iterations: int = 25,
+    tolerance: float = 0.15,
+    step_degrees: float = 1.0,
+    damping: float = 0.25,
+    rest_pose_weight: float = 0.15,
+    debug: bool = False,
+) -> dict[str, float]:
+    """Solve all `effector_names` toward `target_points` simultaneously.
+
+    One combined stacked-Jacobian call per iteration (see
+    `_stacked_jacobian_script`) replaces what would otherwise be one
+    `hand_to_target`/`foot_to_target` call per limb. `pelvis` is shared by
+    both leg chains (see `_CHAINS`); because its effect on *both* feet is
+    visible in the same Jacobian, a single damped-least-squares step per
+    iteration accounts for that coupling directly — solving r_foot can no
+    longer silently undo l_foot's progress, because both are solved for in
+    the same step.
+
+    With only 4 effectors (12 constraints) and up to 9 bones (27 rotation
+    DOFs, with `_CHAINS` as currently defined), the system is still
+    underdetermined: more than one joint configuration can hit the targets
+    exactly, and plain DLS has no reason to prefer one zero-error solution
+    over another. `rest_pose_weight` adds a secondary objective — pull
+    unconstrained DOFs back toward the figure's *starting* rotations —
+    projected through the Jacobian's null space so it never fights the
+    primary hand/foot targets (same `rest_pose_weight` concept as the
+    still-unused `dazpy.SolveOptions.rest_pose_weight` field, applied here
+    for real). 0 disables it.
+
+    Returns ``{effector_name: final_error}`` (scene units) for reporting.
+    """
+    union_chain: list[str] = []
+    for name in effector_names:
+        for bone in _CHAINS[name]:
+            if bone not in union_chain:
+                union_chain.append(bone)
+
+    targets = np.array(target_points, dtype=float)  # (E, 3)
+    n_dof = len(union_chain) * 3
+    n_err = len(effector_names) * 3
+
+    # Start from the figure's actual current rotations (not zero) so any
+    # rotation already on these bones is preserved and refined, not clobbered.
+    # Also doubles as the rest-pose bias target below.
+    current_rot = figure.bone_rotations()
+    current = {
+        name: list(current_rot.get(name, (0.0, 0.0, 0.0)))
+        for name in union_chain
+    }
+    rest_flat = np.array(
+        [current[name][axis] for name in union_chain for axis in range(3)]
+    )
+
+    final_error = {name: float("inf") for name in effector_names}
+
+    for iteration in range(max_iterations):
+        script = _stacked_jacobian_script(figure_label, union_chain, effector_names, step_degrees)
+        result = _call_with_busy_retry(lambda: client.execute(script).value)
+        if result is None or result.get("error"):
+            sys.exit(
+                f"Error: stacked IK solve failed on {figure_label!r} "
+                f"({result.get('name') if result else 'skeleton not found'})."
+            )
+
+        base = np.array(result["base"], dtype=float)  # (E, 3)
+        error_vec = targets - base                    # (E, 3)
+        for i, name in enumerate(effector_names):
+            final_error[name] = float(np.linalg.norm(error_vec[i]))
+
+        if debug:
+            errs = "  ".join(f"{n}={final_error[n]:.3f}" for n in effector_names)
+            print(f"    iter {iteration + 1:2d}/{max_iterations}: {errs}")
+
+        if all(e <= tolerance for e in final_error.values()):
+            break
+
+        flat_error = error_vec.flatten()               # (E*3,)
+        columns = np.array(result["columns"], dtype=float)  # (n_dof, E*3)
+        J = columns.T                                   # (E*3, n_dof)
+
+        # Damped least squares in the row space (n_dof > E*3, i.e. more DOFs
+        # than target coordinates — the usual underdetermined-IK case): solve
+        # (J J^T + damping*I) y = error, then delta = J^T y. Same formula as
+        # dazpy's own single-chain solver (_interaction.py's
+        # _damped_least_squares_step), generalized from a 3-row error vector
+        # to E*3 rows so all four effectors are solved in one linear system.
+        JJt = J @ J.T + damping * np.eye(n_err)
+        try:
+            JJt_inv = np.linalg.inv(JJt)
+        except np.linalg.LinAlgError:
+            break
+        J_pinv = J.T @ JJt_inv                            # (n_dof, E*3)
+        delta = J_pinv @ flat_error                        # (n_dof,) primary task
+
+        if rest_pose_weight > 0:
+            # Null-space secondary task: pull toward the starting pose without
+            # touching the DOF combinations the primary task above already
+            # claimed — (I - J_pinv @ J) projects a vector onto exactly the
+            # subspace the targets don't constrain.
+            current_flat = np.array(
+                [current[name][axis] for name in union_chain for axis in range(3)]
+            )
+            null_space = np.eye(n_dof) - J_pinv @ J
+            rest_pull = rest_pose_weight * (rest_flat - current_flat)
+            delta = delta + null_space @ rest_pull
+
+        max_delta = float(np.abs(delta).max()) if n_dof else 0.0
+        if max_delta > step_degrees:
+            delta *= step_degrees / max_delta
+
+        for bone_idx, bone_name in enumerate(union_chain):
+            for axis in range(3):
+                current[bone_name][axis] += float(delta[bone_idx * 3 + axis])
+
+        figure.set_bone_rotations({name: tuple(vals) for name, vals in current.items()})
+
+    return final_error
 
 
 if __name__ == "__main__":
@@ -268,21 +500,26 @@ if __name__ == "__main__":
                         help="Skip wrist targets")
     parser.add_argument("--no-feet", dest="feet", action="store_false",
                         help="Skip ankle targets")
-    parser.add_argument("--max-iterations", type=int, default=25,
-                        help="Max IK iterations per limb, per pass (default: 25)")
+    parser.add_argument("--max-iterations", type=int, default=150,
+                        help="Max stacked-IK iterations for the whole simultaneous solve "
+                             "(default: 150 — this is a real numerical solve, not a quick "
+                             "lookup; large displacements from rest can need most of that)")
     parser.add_argument("--tolerance", type=float, default=0.15,
-                        help="IK convergence distance in scene units (default: 0.15)")
-    parser.add_argument("--passes", type=int, default=2,
-                        help="Relaxation passes over all limb targets (default: 2). "
-                             "l_hand/r_hand share the spine4 root bone in their IK chains, "
-                             "and l_foot/r_foot share hip/pelvis — solving one limb can "
-                             "disturb an already-converged one. Extra passes re-solve every "
-                             "limb from the improved starting pose, converging closer.")
+                        help="IK convergence distance in scene units, per effector (default: 0.15)")
+    parser.add_argument("--step-degrees", type=float, default=1.0,
+                        help="Max per-bone rotation change per iteration, in degrees (default: 1.0)")
+    parser.add_argument("--damping", type=float, default=0.1,
+                        help="Damped-least-squares damping factor (default: 0.1)")
+    parser.add_argument("--rest-pose-weight", type=float, default=0.15,
+                        help="Null-space bias pulling unconstrained joints back toward the "
+                             "figure's starting pose, 0-1 (default: 0.15). Raise if limbs "
+                             "look contorted despite low convergence error; 0 disables it.")
     parser.add_argument("--debug", action="store_true",
-                        help="Print per-limb IK convergence diagnostics")
+                        help="Print per-iteration convergence diagnostics")
     args = parser.parse_args()
 
     scene = DazScene()
+    client = DazClient()
     try:
         figure = scene.find_skeleton_by_label(args.figure)
     except Exception:
@@ -318,43 +555,39 @@ if __name__ == "__main__":
     )
     print(f"Calibrated scale: {unit_scale:.4f} (scene units per photo unit)")
 
-    targets: list[tuple[str, str, tuple[float, float, float]]] = []
+    effector_names: list[str] = []
+    target_points: list[tuple[float, float, float]] = []
     if args.hands:
-        targets.append(("hand", "l_hand", to_daz_world(landmarks[L_WRIST], mp_hip_mid, daz_hip_world, unit_scale)))
-        targets.append(("hand", "r_hand", to_daz_world(landmarks[R_WRIST], mp_hip_mid, daz_hip_world, unit_scale)))
+        effector_names += ["l_hand", "r_hand"]
+        target_points += [
+            to_daz_world(landmarks[L_WRIST], mp_hip_mid, daz_hip_world, unit_scale),
+            to_daz_world(landmarks[R_WRIST], mp_hip_mid, daz_hip_world, unit_scale),
+        ]
     if args.feet:
-        targets.append(("foot", "l_foot", to_daz_world(landmarks[L_ANKLE], mp_hip_mid, daz_hip_world, unit_scale)))
-        targets.append(("foot", "r_foot", to_daz_world(landmarks[R_ANKLE], mp_hip_mid, daz_hip_world, unit_scale)))
+        effector_names += ["l_foot", "r_foot"]
+        target_points += [
+            to_daz_world(landmarks[L_ANKLE], mp_hip_mid, daz_hip_world, unit_scale),
+            to_daz_world(landmarks[R_ANKLE], mp_hip_mid, daz_hip_world, unit_scale),
+        ]
 
-    print(f"\nApplying pose to {args.figure!r} ({len(targets)} limb targets, "
-          f"{args.passes} pass(es))...")
+    if not effector_names:
+        sys.exit("Nothing to do — both --no-hands and --no-feet were given.")
+
+    for name, point in zip(effector_names, target_points):
+        print(f"  {name:10s} target -> {point[0]:+7.2f}, {point[1]:+7.2f}, {point[2]:+7.2f}")
+
+    print(f"\nSolving {len(effector_names)} limb targets on {args.figure!r} simultaneously...")
     with scene.undo("Apply photo pose"):
-        for pass_num in range(1, args.passes + 1):
-            if args.passes > 1:
-                print(f"\n-- pass {pass_num}/{args.passes} --")
-            for i, (kind, anchor, point) in enumerate(targets):
-                if kind == "hand":
-                    result = _call_with_busy_retry(lambda: figure.hand_to_target(
-                        point, source_anchor=anchor,
-                        max_iterations=args.max_iterations, tolerance=args.tolerance,
-                    ))
-                else:
-                    result = _call_with_busy_retry(lambda: figure.foot_to_target(
-                        point, source_anchor=anchor,
-                        max_iterations=args.max_iterations, tolerance=args.tolerance,
-                    ))
-                status = "OK" if result.converged else "NOT CONVERGED"
-                print(f"  {anchor:10s} -> {point[0]:+7.2f}, {point[1]:+7.2f}, {point[2]:+7.2f}   [{status}]")
-                if args.debug:
-                    print(f"    chain={result.chain}")
-                    print(f"    iterations={result.iterations}  "
-                          f"initial_error={result.initial_error}  final_error={result.final_error}")
-                # Brief settle time so DAZ Studio's main thread catches up before the
-                # next limb's rig-profile rebuild — reduces (but doesn't eliminate,
-                # hence the retry above) StudioBusyError on back-to-back IK calls.
-                is_last = pass_num == args.passes and i == len(targets) - 1
-                if not is_last:
-                    time.sleep(0.5)
+        final_error = solve_stacked_ik(
+            client, figure, args.figure, effector_names, target_points,
+            max_iterations=args.max_iterations, tolerance=args.tolerance,
+            step_degrees=args.step_degrees, damping=args.damping,
+            rest_pose_weight=args.rest_pose_weight, debug=args.debug,
+        )
 
-    print(f"\nDone. Applied {len(targets)} limb targets to {args.figure!r} "
-          f"over {args.passes} pass(es).")
+    print("\nFinal per-limb error (scene units):")
+    for name in effector_names:
+        status = "OK" if final_error[name] <= args.tolerance else "NOT CONVERGED"
+        print(f"  {name:10s} {final_error[name]:.3f}   [{status}]")
+
+    print(f"\nDone. Applied {len(effector_names)} limb targets to {args.figure!r}.")
