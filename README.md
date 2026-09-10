@@ -55,6 +55,7 @@ This repository contains production-ready examples demonstrating how to control 
 | [dataset_generator](ml_data/dataset_generator/) | ml_data | Intermediate | Randomises a set of expression morphs on a Genesis 9 figure and renders each variation to a numbered... | None |
 | [expression_transfer](ai_vision/expression_transfer/) | ai_vision | Advanced | Extracts a facial expression from a photo using MediaPipe FaceLandmarker, computes Action Unit (AU) ... | Yes |
 | [webcam_expression_mirror](ai_vision/webcam_expression_mirror/) | ai_vision | Advanced | Captures frames from your webcam, runs MediaPipe FaceLandmarker on each frame, and streams the resul... | Yes |
+| [pose_transfer_photo](ai_vision/pose_transfer_photo/) | ai_vision | Advanced | Extracts a body pose from a photo using MediaPipe PoseLandmarker and drives a figure's hands and fee... | Yes |
 
 ## Categories
 
@@ -65,7 +66,7 @@ This repository contains production-ready examples demonstrating how to control 
 - **export/** — USD export, format conversion
 - **rendering/** — Turntable, multi-cam, batch renders, VN workflows, external pipelines
 - **ml_data/** — Dataset generation for ML training
-- **ai_vision/** — MediaPipe expression transfer, webcam mirroring
+- **ai_vision/** — MediaPipe expression transfer, webcam mirroring, photo-based body pose transfer
 - **bvh/** — BVH motion-capture import (in development)
 
 ## Skill Level Guide
