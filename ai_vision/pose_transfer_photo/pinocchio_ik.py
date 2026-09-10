@@ -127,6 +127,69 @@ def angles_from_local_rotation(bone_meta: dict, R_local: np.ndarray) -> dict[str
     return _decompose_euler(order, R_pose)
 
 
+def euler_rate_jacobian(bone_meta: dict, angles_xyz: dict[str, float]) -> np.ndarray:
+    """3x3 matrix E (columns ordered x,y,z) mapping d(angles)/dt to Pinocchio's
+    local (body-frame) angular velocity of `bone_local_rotation`'s R_local.
+
+    Needed for active-set joint-limit handling: dropping a DOF at its limit
+    is a DAZ XYZ-pose-channel concept, but the IK solve's Jacobian columns
+    live in Pinocchio's native SO(3) tangent space (`nv`), not Euler-rate
+    space. This is the standard Euler-rate-to-angular-velocity transform
+    (omega = E(angles) @ d(euler)/dt), composed with the rest_orientation
+    correction `bone_local_rotation` applies, so its columns land directly in
+    the same tangent basis the IK solve's `dv` already uses.
+
+    Derivation: for R_pose = R[order[0]](t1) @ R[order[1]](t2) @ R[order[2]](t3)
+    (the sequential intrinsic product `_compose_euler` builds), the body
+    angular velocity satisfying dR_pose/dt = R_pose @ skew(omega_pose) is
+        omega_pose = (R2 R3)^T e1 * t1' + R3^T e2 * t2' + e3 * t3'
+    (R2, R3 = the axis-rotation matrices for order[1], order[2]; e_i = unit
+    vector along that step's axis). Since R_local = O^T @ R_pose @ O (O =
+    rest_orientation), and R^T skew(v) R == skew(R^T v) for any rotation R,
+    the corresponding body angular velocity of R_local is omega_local =
+    O^T @ omega_pose -- i.e. E_local = O^T @ E_pose, columns re-ordered here
+    to physical axis (x/y/z) rather than sequence position so callers can
+    index by axis letter regardless of `rotation_order`.
+    """
+    order = (bone_meta["rotation_order"] or "XYZ")[::-1]
+    a0, a1, a2 = order[0], order[1], order[2]
+    R1 = _axis_rotation(a0, angles_xyz[a0.lower()])
+    R2 = _axis_rotation(a1, angles_xyz[a1.lower()])
+    R3 = _axis_rotation(a2, angles_xyz[a2.lower()])
+
+    def _unit(axis: str) -> np.ndarray:
+        return np.array([1.0, 0.0, 0.0]) if axis == "X" else (
+            np.array([0.0, 1.0, 0.0]) if axis == "Y" else np.array([0.0, 0.0, 1.0])
+        )
+
+    col = {
+        a0: (R2 @ R3).T @ _unit(a0),
+        a1: R3.T @ _unit(a1),
+        a2: _unit(a2),
+    }
+    E_pose = np.column_stack([col["X"], col["Y"], col["Z"]])
+
+    O = _rest_orientation_matrix(bone_meta)
+    return O.T @ E_pose
+
+
+def axis_limit_active(current_angle: float, min_limit: float, max_limit: float,
+                       proposed_rate: float, eps_deg: float = 1e-6) -> bool:
+    """True if this axis should be dropped from the free-variable set this
+    iteration: it's sitting at (or past) a limit and the proposed rate would
+    push it further past that limit -- or the axis has no valid range at all
+    (min == max, a hinge modeled as a full spherical joint with a dead axis;
+    see `_CHAINS`' l_forearm/l_shoulder axis_limits in pose_transfer_photo.py).
+    """
+    if max_limit - min_limit <= eps_deg:
+        return True
+    if current_angle >= max_limit - eps_deg and proposed_rate > 0:
+        return True
+    if current_angle <= min_limit + eps_deg and proposed_rate < 0:
+        return True
+    return False
+
+
 def _world_pos(bone_meta: dict) -> np.ndarray:
     w = bone_meta["world_position"]
     return np.array([w["x"], w["y"], w["z"]])
@@ -265,6 +328,7 @@ def solve_ik(
     rest_pose_weight: float = 0.15,
     max_step_degrees: float = 1.0,
     debug: bool = False,
+    history: list[dict[str, dict[str, float]]] | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     """Solve `effector_bones` toward `target_points` simultaneously, entirely locally.
 
@@ -280,19 +344,19 @@ def solve_ik(
     *clamped* result, so it always agrees with what pushing `solved_angles` to
     DAZ Studio will actually produce.
 
-    KNOWN GAP — axis limits are not enforced during iteration, only clamped
-    once at the end (see `clamp_angles`'s docstring for why not every
-    iteration). `solve_stacked_ik`'s HTTP-based Jacobian gets joint-limit
-    awareness for free: perturbing a bone already at its limit via DAZ's own
-    `ctrl.setValue()` barely moves it, so that Jacobian column reads near
-    zero and the DLS step naturally avoids relying on it. Pinocchio's
-    analytic Jacobian has no such feedback -- it always assumes every joint
-    is free -- so a target near a joint's limit can converge beautifully in
-    the unconstrained local model and then get pulled substantially off
-    target by the single final clamp. A real fix is an active-set method
-    (drop the Jacobian column for any DOF sitting at its limit *and* being
-    pushed further past it, each iteration) in Euler-rate space rather than
-    Pinocchio's own SO(3) tangent space; not yet implemented (see bd
+    Joint limits are enforced during iteration via an active-set method, not
+    just clamped once at the end: each iteration, any DOF currently at its
+    `axis_limits` boundary (or with no valid range at all, e.g. a hinge's
+    dead axis) *and* being pushed further past it is dropped from the
+    free-variable set for that step. This has to happen in Euler-rate space
+    (see `euler_rate_jacobian`), not Pinocchio's native SO(3) tangent space,
+    since "which axis is at its limit" is a DAZ XYZ-pose-channel concept.
+    `solve_stacked_ik`'s HTTP-based Jacobian got this for free (perturbing a
+    bone already at its limit via DAZ's own `ctrl.setValue()` barely moves
+    it, so that Jacobian column reads near zero); Pinocchio's analytic
+    Jacobian has no such feedback, so without this masking a target near a
+    joint's limit converges beautifully in the unconstrained model and then
+    gets pulled substantially off target by the final clamp (see bd
     daz-script-server-hewu).
     """
     model, data = fm.model, fm.data
@@ -305,6 +369,33 @@ def solve_ik(
     final_error = {name: float("inf") for name in effector_bones}
 
     for iteration in range(max_iterations):
+        # A degenerate axis (min == max, a hinge modeled as a full spherical
+        # joint) has exactly one legal value, so unlike a real-ranged limit
+        # -- where snapping every iteration corrupts real rotation content
+        # apportioned across axes by Euler decomposition, see this
+        # function's docstring on why the final clamp isn't done mid-loop --
+        # there's no ambiguity to lose here. Left uncorrected, the masked
+        # DOF's instantaneous rate is exactly zero (to first order) but a
+        # finite integration step still leaks a small curvature-driven
+        # rotation into it after Euler re-decomposition each iteration, and
+        # since that leakage is never reset, it compounds monotonically over
+        # many iterations. Resync it to its exact legal value before this
+        # iteration's FK/Jacobian so the leak can't accumulate.
+        current_angles = angles_from_configuration(fm, q)
+        resynced = False
+        for name in fm.chain_bones:
+            limits = fm.by_name[name]["axis_limits"]
+            for axis in "xyz":
+                lo, hi = limits[axis]["min"], limits[axis]["max"]
+                if hi - lo <= 1e-6 and current_angles[name][axis] != lo:
+                    current_angles[name][axis] = lo
+                    resynced = True
+        if resynced:
+            q = configuration_from_angles(fm, current_angles)
+
+        if history is not None:
+            history.append(current_angles)
+
         pin.forwardKinematics(model, data, q)
         pin.computeJointJacobians(model, data, q)
 
@@ -324,18 +415,60 @@ def solve_ik(
         ])  # (E*3, nv)
         flat_error = error_vec.flatten()
 
-        JJt = J @ J.T + damping * np.eye(n_err)
+        # Reparametrize the free variable from Pinocchio's native tangent
+        # space (v, per-joint body-frame angular velocity) to Euler-rate
+        # space (u, per-joint d(angle)/dt in x/y/z), via the block-diagonal
+        # v = B @ u. This is what lets "axis at its limit" -- an XYZ-channel
+        # concept -- mask out one specific column instead of an opaque
+        # combination of all three.
+        B = np.zeros((n_v, n_v))
+        for name in fm.chain_bones:
+            meta = fm.by_name[name]
+            idx_v = model.joints[fm.joint_of[name]].idx_v
+            B[idx_v:idx_v + 3, idx_v:idx_v + 3] = euler_rate_jacobian(meta, current_angles[name])
+        J_u = J @ B  # (E*3, nv), columns now indexed by (bone, axis in x/y/z)
+
+        # First pass: solve unconstrained in u-space to get a proposed rate
+        # per axis, purely to decide which axes are trying to leave their
+        # limits this step.
+        JuJut = J_u @ J_u.T + damping * np.eye(n_err)
         try:
-            JJt_inv = np.linalg.inv(JJt)
+            JuJut_inv = np.linalg.inv(JuJut)
         except np.linalg.LinAlgError:
             break
-        J_pinv = J.T @ JJt_inv
-        dv = J_pinv @ flat_error
+        u_proposed = J_u.T @ JuJut_inv @ flat_error
+
+        free_mask = np.ones(n_v, dtype=bool)
+        for name in fm.chain_bones:
+            meta = fm.by_name[name]
+            idx_v = model.joints[fm.joint_of[name]].idx_v
+            limits = meta["axis_limits"]
+            for offset, axis in enumerate("xyz"):
+                free_mask[idx_v + offset] = not axis_limit_active(
+                    current_angle=current_angles[name][axis],
+                    min_limit=limits[axis]["min"],
+                    max_limit=limits[axis]["max"],
+                    proposed_rate=u_proposed[idx_v + offset],
+                )
+
+        J_u_masked = J_u * free_mask  # zero the locked columns
+        JuJut = J_u_masked @ J_u_masked.T + damping * np.eye(n_err)
+        try:
+            JuJut_inv = np.linalg.inv(JuJut)
+        except np.linalg.LinAlgError:
+            break
+        J_u_pinv = J_u_masked.T @ JuJut_inv
+        u = J_u_pinv @ flat_error
+        u[~free_mask] = 0.0
 
         if rest_pose_weight > 0:
-            null_space = np.eye(n_v) - J_pinv @ J
-            rest_pull = pin.difference(model, q, q_rest)  # q_rest (-) q, tangent space
-            dv = dv + null_space @ (rest_pose_weight * rest_pull)
+            null_space = np.eye(n_v) - J_u_pinv @ J_u_masked
+            rest_pull_v = pin.difference(model, q, q_rest)  # q_rest (-) q, tangent space
+            rest_pull_u = np.linalg.solve(B, rest_pull_v)
+            u = u + null_space @ (rest_pose_weight * rest_pull_u)
+            u[~free_mask] = 0.0
+
+        dv = B @ u
 
         max_step = float(np.abs(dv).max()) if n_v else 0.0
         if max_step > step_limit_rad:
