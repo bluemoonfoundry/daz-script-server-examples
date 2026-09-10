@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pinocchio as pin
 
 import pinocchio_ik as pik
 
@@ -91,3 +92,41 @@ def hinge_angle_from_vectors(v_in: np.ndarray, v_out: np.ndarray, axis: str) -> 
     cross = v_in[i] * v_out[j] - v_in[j] * v_out[i]
     dot = v_in[i] * v_out[i] + v_in[j] * v_out[j]
     return float(np.degrees(np.arctan2(cross, dot)))
+
+
+def solve_digit_chain(
+    fm: pik.FigureModel,
+    digit: DigitChain,
+    target1_point: np.ndarray,
+    target2_point: np.ndarray,
+    tip_point: np.ndarray,
+    initial_angles: dict[str, dict[str, float]],
+    **solve_ik_kwargs,
+) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    """IK-solve every bone in `digit.chain_bones` except the last (against
+    `target1_point`/`target2_point`), then set the last bone's one free axis
+    directly from `tip_point` geometry -- nothing observable depends on that
+    bone's own rotation, so IK cannot target it. See this function's
+    docstring in the implementation plan for the derivation.
+    """
+    solved_angles, final_error = pik.solve_ik(
+        fm, digit.effector_bones, np.array([target1_point, target2_point]),
+        initial_angles=initial_angles, **solve_ik_kwargs,
+    )
+
+    q_solved = pik.configuration_from_angles(fm, solved_angles)
+    pin.forwardKinematics(fm.model, fm.data, q_solved)
+    R_ref = fm.data.oMi[fm.joint_of[digit.chain_bones[-2]]].rotation
+
+    v_in_world = np.asarray(target2_point) - np.asarray(target1_point)
+    v_out_world = np.asarray(tip_point) - np.asarray(target2_point)
+
+    tip_meta = fm.by_name[digit.chain_bones[-1]]
+    O_tip = pik._rest_orientation_matrix(tip_meta)
+    w_in = O_tip @ (R_ref.T @ v_in_world)
+    w_out = O_tip @ (R_ref.T @ v_out_world)
+    theta = hinge_angle_from_vectors(w_in, w_out, digit.tip_hinge_axis)
+
+    solved_angles[digit.chain_bones[-1]][digit.tip_hinge_axis] = theta
+    solved_angles = pik.clamp_angles(fm, solved_angles)
+    return solved_angles, final_error

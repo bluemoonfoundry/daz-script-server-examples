@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import finger_ik as fik
+import pinocchio_ik as pik
 
 
 def test_digit_chains_cover_both_hands_and_all_five_digits():
@@ -80,3 +81,67 @@ def test_hinge_angle_from_vectors_ignores_component_along_axis():
     v_in = np.array([1.0, 0.0, 5.0])
     v_out = np.array([0.0, 1.0, -3.0])  # v_in's xy-part (1,0) rotated +90 deg about z
     assert fik.hinge_angle_from_vectors(v_in, v_out, "z") == pytest.approx(90.0, abs=1e-6)
+
+
+def _bone_meta(name, parent_name, world_position, rotation_order="XYZ",
+                rest_orientation=(1.0, 0.0, 0.0, 0.0), axis_limits=None):
+    w, x, y, z = rest_orientation
+    return {
+        "name": name, "parent_name": parent_name,
+        "world_position": {"x": world_position[0], "y": world_position[1], "z": world_position[2]},
+        "rotation_order": rotation_order,
+        "rest_orientation": {"w": w, "x": x, "y": y, "z": z},
+        "axis_limits": axis_limits or {a: {"min": -180.0, "max": 180.0} for a in "xyz"},
+    }
+
+
+def _synthetic_finger_chain():
+    """root -> mid -> hinge2 -> hinge3, mirroring l_index's real shape:
+    root and mid have real x/y/z range, hinge2/hinge3 are pure z-hinges."""
+    root = _bone_meta("root", None, (0.0, 0.0, 0.0))
+    mid = _bone_meta("mid", "root", (1.0, 0.0, 0.0))
+    hinge2 = _bone_meta(
+        "hinge2", "mid", (2.0, 0.0, 0.0),
+        axis_limits={"x": {"min": 0.0, "max": 0.0}, "y": {"min": 0.0, "max": 0.0}, "z": {"min": -105.0, "max": 12.0}},
+    )
+    hinge3 = _bone_meta(
+        "hinge3", "hinge2", (2.7, 0.0, 0.0),
+        axis_limits={"x": {"min": 0.0, "max": 0.0}, "y": {"min": 0.0, "max": 0.0}, "z": {"min": -90.0, "max": 20.0}},
+    )
+    fm = pik.build_figure_model([root, mid, hinge2, hinge3], ["root", "mid", "hinge2", "hinge3"])
+    digit = fik.DigitChain(
+        chain_bones=["root", "mid", "hinge2", "hinge3"],
+        target1_landmark=6, target2_landmark=7, tip_landmark=8, tip_hinge_axis="z",
+    )
+    return fm, digit
+
+
+def test_solve_digit_chain_recovers_known_tip_hinge_angle():
+    fm, digit = _synthetic_finger_chain()
+    true_angles = {
+        "root": {"x": 5.0, "y": -8.0, "z": 12.0},
+        "mid": {"x": 2.0, "y": 3.0, "z": -20.0},
+        "hinge2": {"x": 0.0, "y": 0.0, "z": -35.0},
+        "hinge3": {"x": 0.0, "y": 0.0, "z": -15.0},
+    }
+    q_true = pik.configuration_from_angles(fm, true_angles)
+    positions = pik.forward_kinematics_positions(fm, q_true)
+    # A synthetic "tip" landmark 0.6 units past hinge3, along its own local
+    # +x direction at the true pose -- stands in for the real TIP landmark,
+    # which has no corresponding bone.
+    import pinocchio as pin
+    pin.forwardKinematics(fm.model, fm.data, q_true)
+    hinge3_world_rot = fm.data.oMi[fm.joint_of["hinge3"]].rotation
+    tip_point = positions["hinge3"] + hinge3_world_rot @ np.array([0.6, 0.0, 0.0])
+
+    initial_angles = {name: {"x": 0.0, "y": 0.0, "z": 0.0} for name in digit.chain_bones}
+    solved, err = fik.solve_digit_chain(
+        fm, digit,
+        target1_point=positions["hinge2"], target2_point=positions["hinge3"], tip_point=tip_point,
+        initial_angles=initial_angles, max_iterations=150, tolerance=0.01,
+    )
+
+    assert err["hinge3"] < 0.05
+    assert solved["hinge3"]["z"] == pytest.approx(true_angles["hinge3"]["z"], abs=1.0)
+    assert solved["hinge3"]["x"] == pytest.approx(0.0, abs=1e-6)
+    assert solved["hinge3"]["y"] == pytest.approx(0.0, abs=1e-6)
