@@ -11,12 +11,20 @@ IK aligner already built into dazpy (`DazSkeleton.hand_to_target` /
 
 It is an *example*, not a full-body motion-capture tool.  Only the four limb
 effectors (both wrists, both ankles) are driven — elbows/knees follow from the
-IK chain solve rather than being matched to the photo directly, and the torso,
-spine, and head are left at rest.  A real system would also solve pelvis/spine
-orientation and account for camera perspective.  The goal here is to show that
-the script server's existing IK aligner can be driven from arbitrary Python
-vision output, not just from the interaction-recipe / hardcoded-target
-call sites shown elsewhere in this repo.
+IK chain solve rather than being matched to the photo directly.  Torso/head
+aren't independently targeted, but the hand chains share `spine4` and the foot
+chains share `hip`/`pelvis`, so solving one limb can visibly tilt the spine or
+hips as a side effect (the head, undriven, inherits that tilt).  A real system
+would solve pelvis/spine orientation explicitly and account for camera
+perspective.  The goal here is to show that the script server's existing IK
+aligner can be driven from arbitrary Python vision output, not just from the
+interaction-recipe / hardcoded-target call sites shown elsewhere in this repo.
+
+IMPORTANT: reset the figure to a neutral pose (e.g. `dazpy.poses.zero_figure`,
+or DAZ Studio's own Zero Pose) before each run.  Calibration reads the
+figure's *current* shoulder-joint and hip world positions, so a leftover pose
+from a previous run — or from manual posing — will throw off both the scale
+and the IK starting point.
 
 WHAT IT DEMONSTRATES
 --------------------
@@ -28,6 +36,9 @@ WHAT IT DEMONSTRATES
   - Reusing DazSkeleton.hand_to_target()/.foot_to_target() — the same
     damped-least-squares IK aligner used by character/ik_bone_to_target.py —
     to drive both wrists and both ankles toward photo-derived world points
+  - Running multiple relaxation passes over all four limbs, since the hand
+    chains share spine4 and the foot chains share hip/pelvis — solving one
+    limb can disturb a root bone another limb already converged against
   - Wrapping the whole pose application in one named undo step
     (scene.undo(...)) so Ctrl+Z in DAZ Studio undoes it in a single step
   - Reporting per-limb IK convergence (iterations, final error) for debugging
@@ -257,10 +268,16 @@ if __name__ == "__main__":
                         help="Skip wrist targets")
     parser.add_argument("--no-feet", dest="feet", action="store_false",
                         help="Skip ankle targets")
-    parser.add_argument("--max-iterations", type=int, default=15,
-                        help="Max IK iterations per limb (default: 15)")
+    parser.add_argument("--max-iterations", type=int, default=25,
+                        help="Max IK iterations per limb, per pass (default: 25)")
     parser.add_argument("--tolerance", type=float, default=0.15,
                         help="IK convergence distance in scene units (default: 0.15)")
+    parser.add_argument("--passes", type=int, default=2,
+                        help="Relaxation passes over all limb targets (default: 2). "
+                             "l_hand/r_hand share the spine4 root bone in their IK chains, "
+                             "and l_foot/r_foot share hip/pelvis — solving one limb can "
+                             "disturb an already-converged one. Extra passes re-solve every "
+                             "limb from the improved starting pose, converging closer.")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-limb IK convergence diagnostics")
     args = parser.parse_args()
@@ -309,29 +326,35 @@ if __name__ == "__main__":
         targets.append(("foot", "l_foot", to_daz_world(landmarks[L_ANKLE], mp_hip_mid, daz_hip_world, unit_scale)))
         targets.append(("foot", "r_foot", to_daz_world(landmarks[R_ANKLE], mp_hip_mid, daz_hip_world, unit_scale)))
 
-    print(f"\nApplying pose to {args.figure!r} ({len(targets)} limb targets)...")
+    print(f"\nApplying pose to {args.figure!r} ({len(targets)} limb targets, "
+          f"{args.passes} pass(es))...")
     with scene.undo("Apply photo pose"):
-        for i, (kind, anchor, point) in enumerate(targets):
-            if kind == "hand":
-                result = _call_with_busy_retry(lambda: figure.hand_to_target(
-                    point, source_anchor=anchor,
-                    max_iterations=args.max_iterations, tolerance=args.tolerance,
-                ))
-            else:
-                result = _call_with_busy_retry(lambda: figure.foot_to_target(
-                    point, source_anchor=anchor,
-                    max_iterations=args.max_iterations, tolerance=args.tolerance,
-                ))
-            status = "OK" if result.converged else "NOT CONVERGED"
-            print(f"  {anchor:10s} -> {point[0]:+7.2f}, {point[1]:+7.2f}, {point[2]:+7.2f}   [{status}]")
-            if args.debug:
-                print(f"    chain={result.chain}")
-                print(f"    iterations={result.iterations}  "
-                      f"initial_error={result.initial_error}  final_error={result.final_error}")
-            # Brief settle time so DAZ Studio's main thread catches up before the
-            # next limb's rig-profile rebuild — reduces (but doesn't eliminate,
-            # hence the retry above) StudioBusyError on back-to-back IK calls.
-            if i < len(targets) - 1:
-                time.sleep(0.5)
+        for pass_num in range(1, args.passes + 1):
+            if args.passes > 1:
+                print(f"\n-- pass {pass_num}/{args.passes} --")
+            for i, (kind, anchor, point) in enumerate(targets):
+                if kind == "hand":
+                    result = _call_with_busy_retry(lambda: figure.hand_to_target(
+                        point, source_anchor=anchor,
+                        max_iterations=args.max_iterations, tolerance=args.tolerance,
+                    ))
+                else:
+                    result = _call_with_busy_retry(lambda: figure.foot_to_target(
+                        point, source_anchor=anchor,
+                        max_iterations=args.max_iterations, tolerance=args.tolerance,
+                    ))
+                status = "OK" if result.converged else "NOT CONVERGED"
+                print(f"  {anchor:10s} -> {point[0]:+7.2f}, {point[1]:+7.2f}, {point[2]:+7.2f}   [{status}]")
+                if args.debug:
+                    print(f"    chain={result.chain}")
+                    print(f"    iterations={result.iterations}  "
+                          f"initial_error={result.initial_error}  final_error={result.final_error}")
+                # Brief settle time so DAZ Studio's main thread catches up before the
+                # next limb's rig-profile rebuild — reduces (but doesn't eliminate,
+                # hence the retry above) StudioBusyError on back-to-back IK calls.
+                is_last = pass_num == args.passes and i == len(targets) - 1
+                if not is_last:
+                    time.sleep(0.5)
 
-    print(f"\nDone. Applied {len(targets)} limb targets to {args.figure!r}.")
+    print(f"\nDone. Applied {len(targets)} limb targets to {args.figure!r} "
+          f"over {args.passes} pass(es).")
