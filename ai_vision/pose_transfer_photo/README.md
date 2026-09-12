@@ -27,6 +27,29 @@ Extracts a body pose from a photo using MediaPipe PoseLandmarker, then drives a 
 pip install mediapipe opencv-python numpy
 ```
 
+The above covers the default `--backend stacked`. `--backend pinocchio`
+(local IK solve, needed for `--batch` to actually pay off across many
+photos — see below) needs a **separate environment**, because it depends on
+the real Pinocchio C++/Eigen library, which has no Windows PyPI wheel and
+is only reliably available via conda-forge:
+
+```bash
+conda env create -f environment.yml   # one-time; also installs mediapipe/opencv/dazpy
+```
+
+Then run through that environment via the wrapper scripts in this
+directory, rather than invoking your normal interpreter directly (see
+`pinocchio_ik.py`'s module docstring for the DLL/PATH pitfalls this avoids):
+
+```bash
+./run_pinocchio.ps1 photo.jpg --backend pinocchio     # Windows
+./run_pinocchio.sh  photo.jpg --backend pinocchio     # macOS/Linux
+```
+
+If you forget and run `--backend pinocchio` from the wrong interpreter, the
+import failure now prints these same setup steps instead of a bare
+`ModuleNotFoundError`.
+
 ## Usage
 
 ```bash
@@ -35,6 +58,12 @@ python pose_transfer_photo.py photo.jpg --figure "Jason Cross"
 python pose_transfer_photo.py photo.jpg --scale 1.2
 python pose_transfer_photo.py photo.jpg --no-feet
 python pose_transfer_photo.py photo.jpg --debug
+
+# Batch: process every photo in a folder against one figure (auto-resets to
+# Zero Pose before each), via the pinocchio-ik environment (see Dependencies
+# above). Any combination of the four output flags is allowed.
+./run_pinocchio.ps1 --batch photos/ --backend pinocchio \
+    --save-poses --render --export-mesh --stats-csv --output-dir batch_output/
 ```
 
 ### Arguments

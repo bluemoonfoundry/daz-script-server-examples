@@ -18,27 +18,32 @@ REQUIRES REAL PINOCCHIO (NOT THE PyPI PACKAGE NAMED "pinocchio")
 The actual C++/Eigen robotics library is distributed on PyPI as `pin`, not
 `pinocchio` (that name on PyPI is unrelated software). `pin` has no Windows
 wheel and fails to build from source there without a full VS/Eigen toolchain.
-On Windows, install it from conda-forge instead:
+On Windows (and reliably cross-platform generally), install it from
+conda-forge instead, via this directory's `environment.yml`:
 
-    conda create -n pinocchio-ik -c conda-forge python=3.11 pinocchio numpy scipy
-    conda activate pinocchio-ik
-    pip install -e Y:/working/BlueMoonFoundry/daz-script-server   # dazpy itself
+    conda env create -f environment.yml
 
-Run `pose_transfer_photo.py --backend pinocchio` with *that* environment's
-python.exe -- `--backend pinocchio` still needs mediapipe/opencv in-process
-(landmark extraction happens before the solve), so `pip install mediapipe
-opencv-python` into `pinocchio-ik` too rather than keeping a second venv;
-`--backend stacked` (the default) needs mediapipe/opencv but not Pinocchio,
-so it's fine to keep using a lighter venv for that path if Pinocchio is
-never needed there.
+Then run `pose_transfer_photo.py --backend pinocchio` through that
+environment -- easiest via the wrapper scripts in this directory
+(`run_pinocchio.ps1` on Windows, `run_pinocchio.sh` on macOS/Linux), which
+resolve conda and invoke `conda run -n pinocchio-ik` for you:
 
-IMPORTANT (Windows): invoke this conda env's python.exe directly by absolute
-path only after prepending `<env>/Library/bin` to PATH (conda's own
-activation normally does this for you) -- numpy's BLAS DLL lives there, and
-without it on PATH, plain matrix multiplication segfaults the process with
-no Python traceback at all (looks like the interpreter vanished). Prefer
-`conda run -n pinocchio-ik python pose_transfer_photo.py ...` or an activated
-shell over calling the env's python.exe by raw path.
+    ./run_pinocchio.ps1 photo.jpg --backend pinocchio        # Windows
+    ./run_pinocchio.sh  photo.jpg --backend pinocchio        # macOS/Linux
+
+`--backend pinocchio` still needs mediapipe/opencv in-process (landmark
+extraction happens before the solve) -- environment.yml installs those into
+`pinocchio-ik` too, so there's one environment to manage for this backend,
+not two. `--backend stacked` (the default) needs mediapipe/opencv but not
+Pinocchio, so it's fine to keep using a lighter venv for that path if
+Pinocchio is never needed there.
+
+IMPORTANT (Windows), if invoking this env's python.exe directly instead of
+through the wrapper scripts or `conda run`: prepend `<env>/Library/bin` to
+PATH first (conda's own activation and `conda run` both do this for you
+already) -- numpy's BLAS DLL lives there, and without it on PATH, plain
+matrix multiplication segfaults the process with no Python traceback at all
+(looks like the interpreter vanished).
 
 THE FK FORMULA (validated live against DAZ Studio, see bd daz-script-server-hewu)
 -----------------------------------------------------------------------------------
@@ -61,10 +66,41 @@ for the IK solve instead of finite differences.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 
 import numpy as np
-import pinocchio as pin
+
+try:
+    import pinocchio as pin
+except ImportError as exc:
+    # A bare ModuleNotFoundError here almost always means the WRONG Python
+    # interpreter is running this -- `pinocchio` (the real C++/Eigen
+    # library, distributed as `pin` on PyPI under an unrelated name) only
+    # installs cleanly via conda-forge, in a separate environment from the
+    # default mediapipe/opencv venv this project otherwise uses. See this
+    # module's own top-of-file docstring for the full "why", and
+    # environment.yml (same directory) for the exact env to create.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    sys.exit(
+        f"{exc}\n\n"
+        "pinocchio_ik.py requires the real Pinocchio library, which is not "
+        f"installed in this interpreter ({sys.executable}).\n\n"
+        "Fix: run via the pinocchio-ik conda-forge environment instead of "
+        "this one, either through the wrapper script:\n\n"
+        f"    {os.path.join(_here, 'run_pinocchio.ps1')} <your args>   "
+        "(Windows PowerShell)\n"
+        f"    {os.path.join(_here, 'run_pinocchio.sh')} <your args>    "
+        "(macOS/Linux)\n\n"
+        "...or directly, if you already have the env active:\n\n"
+        "    conda activate pinocchio-ik\n"
+        "    python pose_transfer_photo.py <your args>\n\n"
+        "If the 'pinocchio-ik' environment doesn't exist yet, create it "
+        f"once with (from {_here}):\n\n"
+        "    conda env create -f environment.yml"
+    )
+
 from scipy.spatial.transform import Rotation
 
 

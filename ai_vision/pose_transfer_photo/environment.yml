@@ -1,0 +1,49 @@
+# Conda-forge environment for `pose_transfer_photo.py --backend pinocchio`.
+#
+# WHY THIS EXISTS SEPARATELY FROM requirements.txt
+# --------------------------------------------------
+# The real Pinocchio C++/Eigen library ships on PyPI under the name `pin`
+# (not `pinocchio` -- that PyPI name is unrelated software) and has no
+# Windows wheel; building it from source there needs a full VS/Eigen
+# toolchain. conda-forge ships prebuilt binaries instead, so the pinocchio
+# backend needs its own conda environment -- it cannot be added to
+# requirements.txt/the default venv alongside mediapipe/opencv.
+#
+# CREATE / UPDATE
+# ----------------
+#   conda env create -f environment.yml            # first time
+#   conda env update -f environment.yml --prune     # after editing this file
+#
+# Then either activate it directly:
+#   conda activate pinocchio-ik
+#   python pose_transfer_photo.py photo.jpg --backend pinocchio
+#
+# ...or use run_pinocchio.ps1 / run_pinocchio.sh in this directory, which
+# resolve the env and required PATH entries for you without an explicit
+# `conda activate` step -- see that script's own header comment for why
+# PATH matters here (a missing DLL on PATH segfaults with no traceback).
+#
+# This file pins to what has actually been installed and live-validated
+# against DAZ Studio (see bd daz-script-server-hewu) -- prefer bumping
+# versions deliberately and re-validating over blindly taking newer builds.
+name: pinocchio-ik
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pinocchio=4.1.0
+  - numpy=2.5.3
+  - scipy=1.18.0
+  - pip
+  - pip:
+      - mediapipe==1.0.1
+      - opencv-python==5.0.0.93
+      # dazpy itself -- editable install so local dazpy changes are picked
+      # up immediately without reinstalling. Path is relative to this
+      # environment.yml's location (ai_vision/pose_transfer_photo/): three
+      # levels up reaches the daz-script-server-examples repo's parent
+      # directory, where this assumes daz-script-server (a sibling repo)
+      # is checked out too. If your clone layout differs, either adjust
+      # this path or drop this line and run `pip install dazpy` instead
+      # (a released, non-editable build) after `conda env create`.
+      - -e ../../../daz-script-server

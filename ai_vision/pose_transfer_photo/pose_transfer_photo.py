@@ -96,11 +96,22 @@ Usage:
     python pose_transfer_photo.py photo.jpg --no-feet
     python pose_transfer_photo.py photo.jpg --max-iterations 150 --damping 0.1 --debug
 
-    # --backend pinocchio: local IK solve, zero HTTP round-trips per iteration
-    # (see pinocchio_ik.py for setup -- requires a conda-forge Pinocchio env,
-    # not the default venv). Worthwhile once processing many photos x many
-    # figures; the model build cost per unique figure is then amortized.
-    python pose_transfer_photo.py photo.jpg --backend pinocchio
+    # --backend pinocchio: local IK solve, zero HTTP round-trips per iteration.
+    # Requires a separate conda-forge environment (not the default venv this
+    # script otherwise runs in) -- see environment.yml in this directory, and
+    # run via run_pinocchio.ps1 / run_pinocchio.sh rather than invoking this
+    # interpreter directly (see pinocchio_ik.py's docstring for why). Worth
+    # it once processing many photos x many figures; the model-build cost
+    # per unique figure is then amortized (see pinocchio_ik.get_figure_model,
+    # bd daz-script-server-hewu).
+    ./run_pinocchio.ps1 photo.jpg --backend pinocchio    # or run_pinocchio.sh
+
+    # --batch DIR: process every photo in a folder against one figure,
+    # resetting to Zero Pose between each (see bd daz-script-server-hewu).
+    # Any combination of --save-poses/--render/--export-mesh/--stats-csv
+    # controls what gets written per photo under --output-dir.
+    ./run_pinocchio.ps1 --batch photos/ --backend pinocchio \\
+        --save-poses --stats-csv --output-dir batch_output/
 """
 
 from __future__ import annotations
@@ -116,8 +127,9 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from dazpy import DazClient, DazScene
+from dazpy import DazClient, DazRenderSettings, DazScene
 from dazpy.exceptions import DazBusyError
+from dazpy.poses import zero_figure
 
 # Plausible real-world shoulder width range (meters) used to sanity-check
 # MediaPipe's metric pose estimate — see calibrate()'s docstring.
@@ -540,75 +552,26 @@ def solve_pinocchio_ik(
     return final_error
 
 
-if __name__ == "__main__":
-    # ── CLI ────────────────────────────────────────────────────────────────────────
+def process_photo(image_path: str, figure_label: str, scene: "DazScene", client: DazClient, args) -> dict:
+    """Run the full single-photo pose-transfer pipeline against the given figure.
 
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("image", help="Path to source image")
-    parser.add_argument("--figure", default="Jason Cross",
-                        help="DAZ figure label (default: 'Jason Cross')")
-    parser.add_argument("--backend", choices=["stacked", "pinocchio"], default="stacked",
-                        help="'stacked' (default): original HTTP finite-difference solver, "
-                             "one round-trip per iteration. 'pinocchio': local kinematic model "
-                             "(see pinocchio_ik.py), zero round-trips during iteration, one "
-                             "set_bone_rotations() push at the end -- requires a real Pinocchio "
-                             "install (conda-forge on Windows; see pinocchio_ik.py docstring) "
-                             "and a separate Python environment from mediapipe/opencv.")
-    parser.add_argument("--scale", type=float, default=1.0,
-                        help="Extra multiplier on top of auto-calibrated scale (default: 1.0)")
-    parser.add_argument("--no-hands", dest="hands", action="store_false",
-                        help="Skip wrist targets")
-    parser.add_argument("--no-feet", dest="feet", action="store_false",
-                        help="Skip ankle targets")
-    parser.add_argument("--fingers", action="store_true",
-                        help="Also pose fingers from the same photo via MediaPipe HandLandmarker "
-                             "(requires --backend pinocchio and wrist targets enabled)")
-    parser.add_argument("--max-iterations", type=int, default=150,
-                        help="Max stacked-IK iterations for the whole simultaneous solve "
-                             "(default: 150 — this is a real numerical solve, not a quick "
-                             "lookup; large displacements from rest can need most of that)")
-    parser.add_argument("--tolerance", type=float, default=0.15,
-                        help="IK convergence distance in scene units, per effector (default: 0.15)")
-    parser.add_argument("--step-degrees", type=float, default=1.0,
-                        help="Max per-bone rotation change per iteration, in degrees (default: 1.0)")
-    parser.add_argument("--damping", type=float, default=0.1,
-                        help="Damped-least-squares damping factor (default: 0.1)")
-    parser.add_argument("--rest-pose-weight", type=float, default=0.15,
-                        help="Null-space bias pulling unconstrained joints back toward the "
-                             "figure's starting pose, 0-1 (default: 0.15). Raise if limbs "
-                             "look contorted despite low convergence error; 0 disables it.")
-    parser.add_argument("--debug", action="store_true",
-                        help="Print per-iteration convergence diagnostics")
-    args = parser.parse_args()
-
-    if args.fingers and args.backend != "pinocchio":
-        sys.exit("--fingers requires --backend pinocchio (per-finger IK is too slow over the "
-                  "HTTP stacked backend -- see finger_ik.py's module docstring).")
-    if args.fingers and not args.hands:
-        sys.exit("--fingers requires wrist targets to be enabled (fingers are anchored to the "
-                  "solved wrist position) -- remove --no-hands.")
-
+    Shared by both the single-image CLI path and `--batch` looping below --
+    identical to what the script always did for one photo, just extracted so
+    a batch run can call it once per image without duplicating this logic.
+    Returns a result dict with per-effector and (if `--fingers`) per-digit
+    convergence errors, for reporting/CSV output.
+    """
     if args.fingers:
-        # Imported here (not at module top) since finger_ik/hand_landmarks pull
-        # in pinocchio/mediapipe machinery only needed for this flag -- but
-        # still up front, before the (potentially long) body IK solve below,
-        # so a missing-module error surfaces immediately rather than after
-        # several minutes of body IK work has already run.
         import finger_ik as fik
         from hand_landmarks import extract_hand_world_landmarks
 
-    scene = DazScene()
-    client = DazClient()
     try:
-        figure = scene.find_skeleton_by_label(args.figure)
+        figure = scene.find_skeleton_by_label(figure_label)
     except Exception:
-        sys.exit(f"Error: figure {args.figure!r} not found in scene.")
+        sys.exit(f"Error: figure {figure_label!r} not found in scene.")
 
-    print(f"Extracting pose from {args.image!r}...")
-    landmarks = extract_world_landmarks(args.image)
+    print(f"Extracting pose from {image_path!r}...")
+    landmarks = extract_world_landmarks(image_path)
 
     # Calibrate against the figure's own rest-pose shoulder width and hip position,
     # read once before any IK is applied.
@@ -627,7 +590,7 @@ if __name__ == "__main__":
         daz_hip_world = _world("hip")
     except KeyError as exc:
         sys.exit(
-            f"Bone {exc} not found on {args.figure!r} — this example targets Genesis 9 "
+            f"Bone {exc} not found on {figure_label!r} — this example targets Genesis 9 "
             "bone names (l_upperarm, r_upperarm, hip). Run figure.bones() to list this "
             "figure's actual bone names if it's a different generation."
         )
@@ -658,19 +621,19 @@ if __name__ == "__main__":
     for name, point in zip(effector_names, target_points):
         print(f"  {name:10s} target -> {point[0]:+7.2f}, {point[1]:+7.2f}, {point[2]:+7.2f}")
 
-    print(f"\nSolving {len(effector_names)} limb targets on {args.figure!r} simultaneously "
+    print(f"\nSolving {len(effector_names)} limb targets on {figure_label!r} simultaneously "
           f"(backend={args.backend!r})...")
     with scene.undo("Apply photo pose"):
         if args.backend == "pinocchio":
             final_error = solve_pinocchio_ik(
-                figure, args.figure, effector_names, target_points,
+                figure, figure_label, effector_names, target_points,
                 max_iterations=args.max_iterations, tolerance=args.tolerance,
                 damping=args.damping, rest_pose_weight=args.rest_pose_weight,
                 max_step_degrees=args.step_degrees, debug=args.debug,
             )
         else:
             final_error = solve_stacked_ik(
-                client, figure, args.figure, effector_names, target_points,
+                client, figure, figure_label, effector_names, target_points,
                 max_iterations=args.max_iterations, tolerance=args.tolerance,
                 step_degrees=args.step_degrees, damping=args.damping,
                 rest_pose_weight=args.rest_pose_weight, debug=args.debug,
@@ -681,9 +644,10 @@ if __name__ == "__main__":
         status = "OK" if final_error[name] <= args.tolerance else "NOT CONVERGED"
         print(f"  {name:10s} {final_error[name]:.3f}   [{status}]")
 
+    finger_errors: dict[str, dict[str, float]] = {}
     if args.fingers:
         print("\nExtracting hand landmarks for finger posing...")
-        detected_hands = extract_hand_world_landmarks(args.image)
+        detected_hands = extract_hand_world_landmarks(image_path)
 
         # Re-read bone_metadata() *after* the body IK solve above, but only
         # to learn each wrist's POSED world position (for anchoring landmarks
@@ -705,7 +669,6 @@ if __name__ == "__main__":
         # point, so this doesn't change across digits or hands).
         current_rot = figure.bone_rotations()
 
-        finger_errors: dict[str, dict[str, float]] = {}
         all_solved_angles: dict[str, tuple[float, float, float]] = {}
 
         # MediaPipe HandLandmarker's handedness label assumes a mirrored
@@ -787,7 +750,262 @@ if __name__ == "__main__":
                 status = "OK" if worst <= args.tolerance else "NOT CONVERGED"
                 print(f"  {name:10s} {worst:.3f}   [{status}]")
 
-    summary = f"\nDone. Applied {len(effector_names)} limb targets to {args.figure!r}."
+    summary = f"\nDone. Applied {len(effector_names)} limb targets to {figure_label!r}."
     if args.fingers:
         summary += f" Posed fingers for {len(finger_errors)} digit(s)."
     print(summary)
+
+    return {
+        "image": image_path,
+        "figure": figure_label,
+        "figure_obj": figure,
+        "limb_error": final_error,
+        "finger_error": finger_errors,
+    }
+
+
+# ── batch output actions ────────────────────────────────────────────────────
+# Each of --save-poses / --render / --export-mesh / --stats-csv is independent
+# and combinable -- pass any subset. All write into subdirectories of
+# --output-dir named after the source photo's filename stem, so results from
+# different photos (and different output kinds) never collide.
+
+def _stem(image_path: str) -> str:
+    return os.path.splitext(os.path.basename(image_path))[0]
+
+
+def save_pose_preset(figure, image_path: str, output_dir: str) -> str:
+    """Save the figure's current pose-channel angles as a small JSON file.
+
+    Not a native DAZ Studio .duf pose preset -- writing one of those goes
+    through content-library save dialogs that can pop a blocking modal (see
+    this project's own crash notes on live DazScript dialogs), which isn't
+    safe to drive unattended across a batch of photos. This captures the
+    same information (every posed bone's X/Y/Z rotation) in a format any
+    later step can re-apply via `figure.set_bone_rotations()` without going
+    near DAZ Studio's UI.
+    """
+    poses_dir = os.path.join(output_dir, "poses")
+    os.makedirs(poses_dir, exist_ok=True)
+    path = os.path.join(poses_dir, f"{_stem(image_path)}.json")
+    rotations = _call_with_busy_retry(figure.bone_rotations)
+    with open(path, "w") as f:
+        json.dump({name: list(xyz) for name, xyz in rotations.items()}, f, indent=2)
+    return path
+
+
+def render_photo(client: DazClient, image_path: str, output_dir: str) -> str:
+    renders_dir = os.path.join(output_dir, "renders")
+    os.makedirs(renders_dir, exist_ok=True)
+    path = os.path.join(renders_dir, f"{_stem(image_path)}.png")
+    settings = DazRenderSettings(client)
+
+    def _do_render():
+        settings.output_path = path
+        return settings.render()
+
+    outcome = _call_with_busy_retry(_do_render)
+    if not outcome.success:
+        print(f"  WARNING: render failed for {image_path!r}")
+    return outcome.output_path or path
+
+
+def export_mesh(scene: "DazScene", image_path: str, output_dir: str) -> str:
+    meshes_dir = os.path.join(output_dir, "meshes")
+    os.makedirs(meshes_dir, exist_ok=True)
+    path = os.path.join(meshes_dir, f"{_stem(image_path)}.obj")
+    _call_with_busy_retry(lambda: scene.export_obj(path, selected_only=False))
+    return path
+
+
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def find_batch_images(batch_dir: str) -> list[str]:
+    names = sorted(
+        name for name in os.listdir(batch_dir)
+        if name.lower().endswith(_IMAGE_EXTENSIONS)
+    )
+    return [os.path.join(batch_dir, name) for name in names]
+
+
+def write_stats_csv(path: str, results: list[dict], failures: list[dict] | None = None) -> None:
+    """Write one row per photo -- successes with per-limb error, failures (a
+    photo `process_photo()` couldn't process at all, e.g. no pose detected)
+    with empty limb columns and their failure reason in `note`, so a batch
+    with some unprocessable photos still produces one complete, readable
+    record of what happened to every photo instead of silently omitting
+    the failed ones.
+    """
+    import csv
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    limb_names = sorted({name for r in results for name in r["limb_error"]})
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image", "figure"] + limb_names + ["converged", "note"])
+        for r in results:
+            row = [r["image"], r["figure"]]
+            all_ok = True
+            for name in limb_names:
+                err = r["limb_error"].get(name)
+                row.append(f"{err:.4f}" if err is not None else "")
+                if err is not None and err > r.get("tolerance", 0.15):
+                    all_ok = False
+            row.append("yes" if all_ok else "no")
+            row.append("")
+            writer.writerow(row)
+        for f_ in (failures or []):
+            row = [f_["image"], f_["figure"]] + [""] * len(limb_names) + ["error", f_["reason"]]
+            writer.writerow(row)
+
+
+if __name__ == "__main__":
+    # ── CLI ────────────────────────────────────────────────────────────────────────
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("image", nargs="?", default=None,
+                        help="Path to source image. Omit when using --batch.")
+    parser.add_argument("--batch", metavar="DIR", default=None,
+                        help="Process every image (.png/.jpg/.jpeg/.webp) in DIR against "
+                             "--figure, one after another, instead of a single --image. "
+                             "The figure is reset to Zero Pose (dazpy.poses.zero_figure) "
+                             "before each photo, same as manual between-run guidance. "
+                             "Pair with --backend pinocchio to actually get the per-figure "
+                             "model-caching payoff (see pinocchio_ik.get_figure_model) -- "
+                             "the default 'stacked' backend re-pays its HTTP round-trip cost "
+                             "on every photo regardless of batching.")
+    parser.add_argument("--output-dir", metavar="DIR", default="batch_output",
+                        help="Root directory for --save-poses/--render/--export-mesh/"
+                             "--stats-csv output (default: 'batch_output'). Each kind writes "
+                             "into its own subdirectory, one file per photo named after the "
+                             "photo's filename stem.")
+    parser.add_argument("--save-poses", action="store_true",
+                        help="Save each photo's solved pose-channel angles as a JSON file "
+                             "under <output-dir>/poses/. Combinable with any other --save-*/"
+                             "--render/--export-mesh/--stats-csv flag.")
+    parser.add_argument("--render", action="store_true",
+                        help="Render each photo's posed figure to <output-dir>/renders/ "
+                             "(from the active viewport camera). Combinable with the other "
+                             "output flags. This is a real DAZ Studio render per photo -- "
+                             "expect it to dominate wall-clock time in a large batch.")
+    parser.add_argument("--export-mesh", action="store_true",
+                        help="Export each photo's posed figure to <output-dir>/meshes/ as "
+                             "OBJ. Combinable with the other output flags.")
+    parser.add_argument("--stats-csv", action="store_true",
+                        help="Write one row per photo (per-limb convergence error + overall "
+                             "converged yes/no) to <output-dir>/stats.csv. Combinable with "
+                             "the other output flags; per-photo convergence is always also "
+                             "printed to stdout regardless of this flag.")
+    parser.add_argument("--figure", default="Jason Cross",
+                        help="DAZ figure label (default: 'Jason Cross')")
+    parser.add_argument("--backend", choices=["stacked", "pinocchio"], default="stacked",
+                        help="'stacked' (default): original HTTP finite-difference solver, "
+                             "one round-trip per iteration. 'pinocchio': local kinematic model "
+                             "(see pinocchio_ik.py), zero round-trips during iteration, one "
+                             "set_bone_rotations() push at the end -- requires the separate "
+                             "'pinocchio-ik' conda-forge environment (see environment.yml); "
+                             "run via run_pinocchio.ps1/.sh rather than this interpreter "
+                             "directly, or you'll hit an import error with setup instructions.")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Extra multiplier on top of auto-calibrated scale (default: 1.0)")
+    parser.add_argument("--no-hands", dest="hands", action="store_false",
+                        help="Skip wrist targets")
+    parser.add_argument("--no-feet", dest="feet", action="store_false",
+                        help="Skip ankle targets")
+    parser.add_argument("--fingers", action="store_true",
+                        help="Also pose fingers from the same photo via MediaPipe HandLandmarker "
+                             "(requires --backend pinocchio and wrist targets enabled)")
+    parser.add_argument("--max-iterations", type=int, default=150,
+                        help="Max stacked-IK iterations for the whole simultaneous solve "
+                             "(default: 150 — this is a real numerical solve, not a quick "
+                             "lookup; large displacements from rest can need most of that)")
+    parser.add_argument("--tolerance", type=float, default=0.15,
+                        help="IK convergence distance in scene units, per effector (default: 0.15)")
+    parser.add_argument("--step-degrees", type=float, default=1.0,
+                        help="Max per-bone rotation change per iteration, in degrees (default: 1.0)")
+    parser.add_argument("--damping", type=float, default=0.1,
+                        help="Damped-least-squares damping factor (default: 0.1)")
+    parser.add_argument("--rest-pose-weight", type=float, default=0.15,
+                        help="Null-space bias pulling unconstrained joints back toward the "
+                             "figure's starting pose, 0-1 (default: 0.15). Raise if limbs "
+                             "look contorted despite low convergence error; 0 disables it.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print per-iteration convergence diagnostics")
+    args = parser.parse_args()
+
+    if bool(args.batch) == bool(args.image):
+        sys.exit("Pass exactly one of a single image path or --batch DIR.")
+
+    if args.fingers and args.backend != "pinocchio":
+        sys.exit("--fingers requires --backend pinocchio (per-finger IK is too slow over the "
+                  "HTTP stacked backend -- see finger_ik.py's module docstring).")
+    if args.fingers and not args.hands:
+        sys.exit("--fingers requires wrist targets to be enabled (fingers are anchored to the "
+                  "solved wrist position) -- remove --no-hands.")
+
+    if args.batch:
+        image_paths = find_batch_images(args.batch)
+        if not image_paths:
+            sys.exit(f"No {'/'.join(_IMAGE_EXTENSIONS)} images found in {args.batch!r}.")
+        print(f"Batch: {len(image_paths)} photo(s) from {args.batch!r} -> {args.figure!r}")
+    else:
+        image_paths = [args.image]
+
+    scene = DazScene()
+    client = DazClient()
+
+    results: list[dict] = []
+    failures: list[dict] = []
+    for i, image_path in enumerate(image_paths, start=1):
+        if args.batch:
+            print(f"\n[{i}/{len(image_paths)}] {image_path}")
+            figure = _call_with_busy_retry(lambda: scene.find_skeleton_by_label(args.figure))
+            _call_with_busy_retry(lambda: zero_figure(figure))
+
+        if args.batch:
+            # process_photo() (via extract_world_landmarks()/calibrate()/etc.)
+            # uses sys.exit() for per-photo problems like "no pose detected"
+            # or "degenerate detection" -- correct for a single-image run
+            # (a real error, exit the process), wrong for a batch: one
+            # unprocessable photo (extreme crop/angle, occluded figure,
+            # stylized art the pose model can't read) shouldn't abort every
+            # photo after it. Catch it here, record why, and move on.
+            try:
+                result = process_photo(image_path, args.figure, scene, client, args)
+            except SystemExit as exc:
+                reason = str(exc.code) if exc.code is not None else "unknown error"
+                print(f"  SKIPPED: {reason}")
+                failures.append({"image": image_path, "figure": args.figure, "reason": reason})
+                continue
+        else:
+            result = process_photo(image_path, args.figure, scene, client, args)
+
+        result["tolerance"] = args.tolerance
+        results.append(result)
+
+        if args.save_poses:
+            path = save_pose_preset(result["figure_obj"], image_path, args.output_dir)
+            print(f"  saved pose -> {path}")
+        if args.render:
+            path = render_photo(client, image_path, args.output_dir)
+            print(f"  rendered -> {path}")
+        if args.export_mesh:
+            path = export_mesh(scene, image_path, args.output_dir)
+            print(f"  exported mesh -> {path}")
+
+    if args.stats_csv:
+        csv_path = os.path.join(args.output_dir, "stats.csv")
+        write_stats_csv(csv_path, results, failures)
+        print(f"\nStats written -> {csv_path}")
+
+    if args.batch:
+        converged = sum(
+            1 for r in results if all(e <= args.tolerance for e in r["limb_error"].values())
+        )
+        print(f"\nBatch done: {converged}/{len(results)} converged, "
+              f"{len(results) - converged}/{len(results)} not converged, "
+              f"{len(failures)} skipped (no pose detected/other error), "
+              f"out of {len(image_paths)} total photo(s).")
