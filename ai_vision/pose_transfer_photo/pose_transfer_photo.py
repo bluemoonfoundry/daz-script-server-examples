@@ -828,6 +828,15 @@ def render_photo(
     return paths
 
 
+def simulate_dforce(scene: "DazScene", memorized_pose: bool) -> None:
+    """Run a dForce simulation against the current scene state.
+
+    Blocking (`wait=True`) since the batch loop is inherently sequential per
+    photo anyway -- there's no other work to overlap a sim with.
+    """
+    scene.run_dforce_simulation(memorized_pose=memorized_pose, wait=True)
+
+
 def export_mesh(scene: "DazScene", image_path: str, output_dir: str) -> str:
     meshes_dir = os.path.join(output_dir, "meshes")
     os.makedirs(meshes_dir, exist_ok=True)
@@ -916,6 +925,17 @@ if __name__ == "__main__":
                              "Writes to <output-dir>/renders/<camera-label>/. Implies "
                              "--render; every --camera label is validated against the scene "
                              "before the batch starts.")
+    parser.add_argument("--dforce", action="store_true",
+                        help="Run a dForce simulation (clothing/hair) against the posed figure "
+                             "before rendering/exporting, using the figure's live pose as the "
+                             "sim's starting point. dForce sims can take minutes per photo -- "
+                             "expect this to dominate wall-clock time in a large batch, more so "
+                             "than --render. Implied by --dforce-memorize.")
+    parser.add_argument("--dforce-memorize", action="store_true",
+                        help="Like --dforce, but starts the simulation's pose-based bulge "
+                             "corrections from DAZ Studio's memorized pose instead of the "
+                             "figure's live pose (the 'Start Bulge from Memorized Pose' option "
+                             "in the Simulation Settings pane). Implies --dforce.")
     parser.add_argument("--export-mesh", action="store_true",
                         help="Export each photo's posed figure to <output-dir>/meshes/ as "
                              "OBJ. Combinable with the other output flags.")
@@ -973,6 +993,8 @@ if __name__ == "__main__":
 
     if args.camera:
         args.render = True
+    if args.dforce_memorize:
+        args.dforce = True
 
     if args.batch:
         image_paths = find_batch_images(args.batch)
@@ -1023,6 +1045,9 @@ if __name__ == "__main__":
         if args.save_poses:
             path = save_pose_preset(result["figure_obj"], image_path, args.output_dir)
             print(f"  saved pose -> {path}")
+        if args.dforce:
+            print(f"  simulating dForce ({'memorized' if args.dforce_memorize else 'live'} pose)...")
+            _call_with_busy_retry(lambda: simulate_dforce(scene, args.dforce_memorize))
         if args.render:
             paths = render_photo(client, image_path, args.output_dir, args.camera)
             for path in paths:
