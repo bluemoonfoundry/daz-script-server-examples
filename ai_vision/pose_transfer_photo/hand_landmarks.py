@@ -28,11 +28,28 @@ def _ensure_model() -> str:
 
 def extract_hand_world_landmarks(image_path: str) -> dict[str, list[tuple[float, float, float]]]:
     """Decode an image and return each detected hand's 21 metric-scale world
-    landmarks, keyed by MediaPipe's own handedness label ("Left"/"Right" --
-    per MediaPipe's documented default convention this is the subject's own
-    anatomical hand, matching pose_transfer_photo.py's existing assumption
-    for body landmarks; see Task 6's live validation note if a run's
-    resulting hand poses look mirrored).
+    landmarks, keyed by MediaPipe's own handedness label ("Left"/"Right").
+
+    VERIFIED (final review of the finger-posing plan, 2026-09-11): unlike
+    PoseLandmarker's LEFT_*/RIGHT_* landmark naming (unconditional/anatomical
+    -- no mirroring assumption, per pose_transfer_photo.py's own landmark
+    comment), MediaPipe's Hands/HandLandmarker handedness label assumes a
+    MIRRORED (selfie-style) input image. Google's own docs, verbatim:
+    "handedness is determined assuming the input image is mirrored, i.e.,
+    taken with a front-facing/selfie camera with images flipped
+    horizontally. If it is not the case, please swap the handedness output
+    in the application." (google-ai-edge/mediapipe, docs/solutions/hands.md;
+    same underlying handedness classifier as the newer Tasks-API
+    HandLandmarker used here.)
+
+    This module loads a static image file via `cv2.imread` with no
+    horizontal flip, so the label returned here is the OPPOSITE of the
+    subject's own anatomical hand. The caller (`pose_transfer_photo.py`)
+    accounts for this by swapping the label->side mapping (`"Left"` ->
+    `r_*`, `"Right"` -> `l_*`) rather than doing it here, so this function's
+    contract stays "whatever MediaPipe itself reports" and the swap lives in
+    one visible place next to the body-landmark convention it's being
+    reconciled with.
 
     A hand MediaPipe doesn't detect (occluded, out of frame, low confidence)
     is simply absent from the returned dict -- not an error, since the
@@ -67,5 +84,12 @@ def extract_hand_world_landmarks(image_path: str) -> dict[str, list[tuple[float,
     hands: dict[str, list[tuple[float, float, float]]] = {}
     for handedness, world_landmarks in zip(result.handedness, result.hand_world_landmarks):
         label = handedness[0].category_name  # "Left" or "Right"
+        if label in hands:
+            print(
+                f"Warning: MediaPipe reported two hands both labeled {label!r} "
+                "(likely a misdetection) -- keeping only the last one seen; "
+                "the other detected hand's landmarks are being dropped.",
+                file=sys.stderr,
+            )
         hands[label] = [(lm.x, lm.y, lm.z) for lm in world_landmarks]
     return hands

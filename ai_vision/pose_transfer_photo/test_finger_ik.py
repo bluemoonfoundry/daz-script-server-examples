@@ -148,6 +148,139 @@ def test_solve_digit_chain_recovers_known_tip_hinge_angle():
     assert solved["hinge3"]["y"] == pytest.approx(0.0, abs=1e-6)
 
 
+def _synthetic_wrist_and_finger_chain():
+    """wrist (parent None) -> root -> mid -> hinge2 -> hinge3, mirroring the
+    real l_hand -> l_indexmetacarpal -> l_index1 -> l_index2 -> l_index3
+    shape. Unlike `_synthetic_finger_chain` (whose `root` has no parent at
+    all -- the one configuration where the frame bug is invisible, since a
+    parentless root's "rooted to universe with identity rotation" is
+    already correct), `root` here has a real parent ("wrist") with its own
+    substantial, non-identity rotation -- the exact shape of `l_hand`'s
+    accumulated world rotation after the body IK solve.
+    """
+    wrist = _bone_meta("wrist", None, (0.0, 0.0, 0.0))
+    root = _bone_meta("root", "wrist", (1.0, 0.0, 0.0))
+    mid = _bone_meta("mid", "root", (2.0, 0.0, 0.0))
+    hinge2 = _bone_meta(
+        "hinge2", "mid", (3.0, 0.0, 0.0),
+        axis_limits={"x": {"min": 0.0, "max": 0.0}, "y": {"min": 0.0, "max": 0.0}, "z": {"min": -105.0, "max": 12.0}},
+    )
+    hinge3 = _bone_meta(
+        "hinge3", "hinge2", (3.7, 0.0, 0.0),
+        axis_limits={"x": {"min": 0.0, "max": 0.0}, "y": {"min": 0.0, "max": 0.0}, "z": {"min": -90.0, "max": 20.0}},
+    )
+    all_meta = [wrist, root, mid, hinge2, hinge3]
+    fm_full = pik.build_figure_model(all_meta, ["wrist", "root", "mid", "hinge2", "hinge3"])
+    fm_digit = pik.build_figure_model(all_meta, ["root", "mid", "hinge2", "hinge3"])
+    digit = fik.DigitChain(
+        chain_bones=["root", "mid", "hinge2", "hinge3"],
+        target1_landmark=6, target2_landmark=7, tip_landmark=8, tip_hinge_axis="z",
+    )
+    return all_meta, fm_full, fm_digit, digit
+
+
+def test_naive_digit_solve_is_wrong_under_rotated_wrist_but_frame_correction_fixes_it():
+    """Regression test for the "finger model omits the wrist's accumulated
+    world rotation" bug (final review of the finger-posing plan): a digit
+    chain built from REST metadata roots its first bone directly to the
+    universe frame with IDENTITY rotation, since that bone's real parent
+    (the wrist) is outside the digit-only bone set. That's only exact if the
+    wrist's own accumulated world rotation is actually identity -- true for
+    a freshly-zeroed figure's body solve, false for fingers once the body
+    solve has rotated the wrist. `_synthetic_finger_chain`'s existing test
+    can't catch this: its `root` has no parent at all, so "rooted to
+    universe with identity" is already correct there -- exactly why this bug
+    passed six task reviews undetected (see the plan's final review).
+
+    This test builds a chain with a genuinely rotated parent ("wrist") and
+    shows: (1) naively solving the digit chain from REST metadata directly
+    against the true world-space targets "converges" (small IK residual in
+    its own, wrong frame) but produces WRONG bone angles -- applying them
+    under the wrist's real rotation lands far from the true target
+    positions; (2) pre-rotating the targets into the wrist's REST frame via
+    `wrist_world_rotation`/`rotate_target_into_rest_wrist_frame` (the actual
+    fix applied in pose_transfer_photo.py) recovers the true target
+    positions closely.
+    """
+    all_meta, fm_full, fm_digit, digit = _synthetic_wrist_and_finger_chain()
+
+    true_angles = {
+        "wrist": {"x": 35.0, "y": -50.0, "z": 65.0},
+        "root": {"x": 5.0, "y": -8.0, "z": 12.0},
+        "mid": {"x": 2.0, "y": 3.0, "z": -20.0},
+        "hinge2": {"x": 0.0, "y": 0.0, "z": -35.0},
+        "hinge3": {"x": 0.0, "y": 0.0, "z": -15.0},
+    }
+    q_true = pik.configuration_from_angles(fm_full, true_angles)
+    positions_true = pik.forward_kinematics_positions(fm_full, q_true)
+
+    import pinocchio as pin
+    pin.forwardKinematics(fm_full.model, fm_full.data, q_true)
+    hinge3_world_rot_true = fm_full.data.oMi[fm_full.joint_of["hinge3"]].rotation
+    tip_point_true = positions_true["hinge3"] + hinge3_world_rot_true @ np.array([0.6, 0.0, 0.0])
+
+    target1 = positions_true["hinge2"]
+    target2 = positions_true["hinge3"]
+    tip = tip_point_true
+
+    zero_angles = {name: {"x": 0.0, "y": 0.0, "z": 0.0} for name in digit.chain_bones}
+
+    def _apply_digit_solution_under_true_wrist(solved_digit_angles):
+        full_angles = {"wrist": true_angles["wrist"], **solved_digit_angles}
+        q = pik.configuration_from_angles(fm_full, full_angles)
+        return pik.forward_kinematics_positions(fm_full, q)
+
+    # (1) Naive: solve the digit chain directly against the ground-truth
+    # world targets, using a REST-metadata model that (wrongly) roots `root`
+    # at the universe with identity rotation.
+    naive_solved, naive_err = fik.solve_digit_chain(
+        fm_digit, digit, target1_point=target1, target2_point=target2, tip_point=tip,
+        initial_angles=zero_angles, max_iterations=400, tolerance=0.01,
+    )
+    # It need not converge to the same tight tolerance as the corrected solve
+    # below (the wrong frame can leave some residual even with excess DOF),
+    # but it's not wildly off in its OWN (wrong) frame either -- the point of
+    # this test is that this apparent near-convergence is misleading once
+    # the angles are actually applied under the wrist's true rotation, below.
+    assert naive_err["hinge3"] < 0.75
+
+    naive_positions_applied = _apply_digit_solution_under_true_wrist(naive_solved)
+    naive_real_error = float(np.linalg.norm(naive_positions_applied["hinge3"] - target2))
+    assert naive_real_error > 1.0, (
+        "naive (uncorrected) digit solve should be substantially wrong once its angles "
+        "are actually applied under the wrist's true rotation -- if this fails, the "
+        "synthetic setup no longer exercises the frame bug"
+    )
+
+    # (2) Fixed: pre-rotate the targets into the wrist's REST frame before solving.
+    solved_angles_tuple = {"wrist": (35.0, -50.0, 65.0)}
+    wrist_rotation = fik.wrist_world_rotation(all_meta, [], "wrist", solved_angles_tuple)
+    wrist_rest_world = (0.0, 0.0, 0.0)
+    wrist_posed_world = positions_true["wrist"]
+
+    corrected_target1 = fik.rotate_target_into_rest_wrist_frame(
+        target1, wrist_rest_world, wrist_posed_world, wrist_rotation)
+    corrected_target2 = fik.rotate_target_into_rest_wrist_frame(
+        target2, wrist_rest_world, wrist_posed_world, wrist_rotation)
+    corrected_tip = fik.rotate_target_into_rest_wrist_frame(
+        tip, wrist_rest_world, wrist_posed_world, wrist_rotation)
+
+    fixed_solved, fixed_err = fik.solve_digit_chain(
+        fm_digit, digit,
+        target1_point=corrected_target1, target2_point=corrected_target2, tip_point=corrected_tip,
+        initial_angles=zero_angles, max_iterations=150, tolerance=0.01,
+    )
+    assert fixed_err["hinge3"] < 0.05
+
+    fixed_positions_applied = _apply_digit_solution_under_true_wrist(fixed_solved)
+    fixed_real_error = float(np.linalg.norm(fixed_positions_applied["hinge3"] - target2))
+    assert fixed_real_error < 0.05, (
+        "frame-corrected digit solve should reproduce the true target position closely "
+        "once applied under the wrist's true rotation"
+    )
+    assert fixed_real_error < naive_real_error / 10.0
+
+
 def test_anchor_hand_landmarks_places_wrist_exactly_at_given_position():
     hand_landmarks = [(0.0, 0.0, 0.0), (0.02, -0.01, 0.0), (0.04, -0.02, 0.0)]  # fake, only need [0]
     mp_hip_mid = (0.1, 0.2, 0.3)
