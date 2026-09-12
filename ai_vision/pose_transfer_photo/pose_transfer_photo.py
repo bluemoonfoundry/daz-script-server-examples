@@ -794,20 +794,38 @@ def save_pose_preset(figure, image_path: str, output_dir: str) -> str:
     return path
 
 
-def render_photo(client: DazClient, image_path: str, output_dir: str) -> str:
+def render_photo(
+    client: DazClient, image_path: str, output_dir: str, camera_labels: list[str] | None = None
+) -> list[str]:
+    """Render the current pose to disk, once per camera in *camera_labels*.
+
+    With no *camera_labels*, renders once from the active viewport camera to
+    <output-dir>/renders/<stem>.png (unchanged from before --camera existed).
+    With one or more labels, renders once per camera to
+    <output-dir>/renders/<camera-label>/<stem>.png so results from different
+    cameras never collide. A render failure for one camera is a per-camera
+    warning, not a batch-aborting error -- same resilience as a bad photo.
+    """
     renders_dir = os.path.join(output_dir, "renders")
-    os.makedirs(renders_dir, exist_ok=True)
-    path = os.path.join(renders_dir, f"{_stem(image_path)}.png")
     settings = DazRenderSettings(client)
+    paths = []
 
-    def _do_render():
-        settings.output_path = path
-        return settings.render()
+    for camera_label in (camera_labels or [None]):
+        out_dir = os.path.join(renders_dir, camera_label) if camera_label else renders_dir
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{_stem(image_path)}.png")
 
-    outcome = _call_with_busy_retry(_do_render)
-    if not outcome.success:
-        print(f"  WARNING: render failed for {image_path!r}")
-    return outcome.output_path or path
+        def _do_render(_path=path, _camera_label=camera_label):
+            settings.output_path = _path
+            return settings.render(camera_label=_camera_label)
+
+        outcome = _call_with_busy_retry(_do_render)
+        if not outcome.success:
+            camera_note = f" (camera {camera_label!r})" if camera_label else ""
+            print(f"  WARNING: render failed for {image_path!r}{camera_note}")
+        paths.append(outcome.output_path or path)
+
+    return paths
 
 
 def export_mesh(scene: "DazScene", image_path: str, output_dir: str) -> str:
@@ -891,6 +909,13 @@ if __name__ == "__main__":
                              "(from the active viewport camera). Combinable with the other "
                              "output flags. This is a real DAZ Studio render per photo -- "
                              "expect it to dominate wall-clock time in a large batch.")
+    parser.add_argument("--camera", metavar="LABEL", action="append", default=None,
+                        help="Render from this named camera (the label shown in the Scene "
+                             "panel) instead of the active viewport camera. Repeatable -- "
+                             "pass multiple times to render each photo from each camera. "
+                             "Writes to <output-dir>/renders/<camera-label>/. Implies "
+                             "--render; every --camera label is validated against the scene "
+                             "before the batch starts.")
     parser.add_argument("--export-mesh", action="store_true",
                         help="Export each photo's posed figure to <output-dir>/meshes/ as "
                              "OBJ. Combinable with the other output flags.")
@@ -946,6 +971,9 @@ if __name__ == "__main__":
         sys.exit("--fingers requires wrist targets to be enabled (fingers are anchored to the "
                   "solved wrist position) -- remove --no-hands.")
 
+    if args.camera:
+        args.render = True
+
     if args.batch:
         image_paths = find_batch_images(args.batch)
         if not image_paths:
@@ -956,6 +984,12 @@ if __name__ == "__main__":
 
     scene = DazScene()
     client = DazClient()
+
+    if args.camera:
+        known_labels = {cam.label for cam in scene.cameras()}
+        unknown = [label for label in args.camera if label not in known_labels]
+        if unknown:
+            sys.exit(f"--camera label(s) not found in scene: {', '.join(map(repr, unknown))}")
 
     results: list[dict] = []
     failures: list[dict] = []
@@ -990,8 +1024,9 @@ if __name__ == "__main__":
             path = save_pose_preset(result["figure_obj"], image_path, args.output_dir)
             print(f"  saved pose -> {path}")
         if args.render:
-            path = render_photo(client, image_path, args.output_dir)
-            print(f"  rendered -> {path}")
+            paths = render_photo(client, image_path, args.output_dir, args.camera)
+            for path in paths:
+                print(f"  rendered -> {path}")
         if args.export_mesh:
             path = export_mesh(scene, image_path, args.output_dir)
             print(f"  exported mesh -> {path}")
