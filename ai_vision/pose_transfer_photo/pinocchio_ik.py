@@ -264,6 +264,55 @@ def build_figure_model(bone_metadata: list[dict], chain_bones: list[str]) -> Fig
     return FigureModel(model=model, data=data, chain_bones=chain_bones, by_name=by_name, joint_of=joint_of)
 
 
+# ── per-figure model cache ──────────────────────────────────────────────────
+#
+# `build_figure_model()` itself is cheap relative to an HTTP round-trip, but
+# the whole point of the batch pipeline (bd daz-script-server-hewu) is to pay
+# the "read bone_metadata() + build a kinematic model" cost once per unique
+# figure, not once per photo. Two DAZ figures can share the same rig topology
+# but differ in proportions (arm/leg length from body-shape morphs), so the
+# cache key can't be the figure label alone -- it includes a hash of each
+# chain bone's rest world position, which changes if a morph is applied
+# between runs and forces a rebuild instead of silently reusing a stale model.
+
+_figure_model_cache: dict[tuple, "FigureModel"] = {}
+
+
+def _proportions_key(bone_metadata: list[dict], chain_bones: list[str]) -> tuple:
+    by_name = {b["name"]: b for b in bone_metadata}
+    return tuple(
+        (
+            name,
+            round(by_name[name]["world_position"]["x"], 6),
+            round(by_name[name]["world_position"]["y"], 6),
+            round(by_name[name]["world_position"]["z"], 6),
+        )
+        for name in sorted(chain_bones)
+    )
+
+
+def get_figure_model(figure_label: str, bone_metadata: list[dict], chain_bones: list[str]) -> FigureModel:
+    """Return a cached `FigureModel` for this figure+chain, building it only on
+    first use (or after a proportions change invalidates the cache entry).
+
+    `bone_metadata` is still read fresh by the caller every run (it also
+    carries current pose-channel state needed elsewhere), but the relatively
+    expensive model construction below is skipped on a cache hit.
+    """
+    key = (figure_label, tuple(sorted(chain_bones)), _proportions_key(bone_metadata, chain_bones))
+    cached = _figure_model_cache.get(key)
+    if cached is not None:
+        return cached
+    fm = build_figure_model(bone_metadata, chain_bones)
+    _figure_model_cache[key] = fm
+    return fm
+
+
+def clear_figure_model_cache() -> None:
+    """Drop all cached FigureModels (e.g. between unrelated test figures)."""
+    _figure_model_cache.clear()
+
+
 # ── configuration <-> DAZ pose-channel angles ───────────────────────────────
 
 def configuration_from_angles(fm: FigureModel, angles: dict[str, dict[str, float]]) -> np.ndarray:

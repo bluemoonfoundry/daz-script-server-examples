@@ -520,7 +520,7 @@ def solve_pinocchio_ik(
             union_chain.append(name)  # effector itself is a pure position marker in the model
 
     meta = figure.bone_metadata()
-    fm = pik.build_figure_model(meta, union_chain)
+    fm = pik.get_figure_model(figure_label, meta, union_chain)
 
     current_rot = figure.bone_rotations()
     initial_angles = {
@@ -590,6 +590,15 @@ if __name__ == "__main__":
     if args.fingers and not args.hands:
         sys.exit("--fingers requires wrist targets to be enabled (fingers are anchored to the "
                   "solved wrist position) -- remove --no-hands.")
+
+    if args.fingers:
+        # Imported here (not at module top) since finger_ik/hand_landmarks pull
+        # in pinocchio/mediapipe machinery only needed for this flag -- but
+        # still up front, before the (potentially long) body IK solve below,
+        # so a missing-module error surfaces immediately rather than after
+        # several minutes of body IK work has already run.
+        import finger_ik as fik
+        from hand_landmarks import extract_hand_world_landmarks
 
     scene = DazScene()
     client = DazClient()
@@ -673,50 +682,91 @@ if __name__ == "__main__":
         print(f"  {name:10s} {final_error[name]:.3f}   [{status}]")
 
     if args.fingers:
-        import finger_ik as fik
-        from hand_landmarks import extract_hand_world_landmarks
-
         print("\nExtracting hand landmarks for finger posing...")
         detected_hands = extract_hand_world_landmarks(args.image)
 
-        # Re-read bone_metadata() *after* the body IK solve above -- l_hand/
-        # r_hand's world_position now reflects the solved wrist, not the
-        # pre-solve rest pose captured in `by_name`. Every digit lookup below
-        # must go through this fresh snapshot, not the stale `by_name`.
+        # Re-read bone_metadata() *after* the body IK solve above, but only
+        # to learn each wrist's POSED world position (for anchoring landmarks
+        # and as the "from" side of the frame-correction below) -- every
+        # digit's own IK model is still built from the REST snapshot
+        # (`by_name`, captured before the body solve), not this one. Building
+        # from REST metadata is what keeps each digit's geometry (and its
+        # universe-rooted parent assumption) correct regardless of the
+        # wrist's post-solve rotation; see `finger_ik.wrist_world_rotation`'s
+        # docstring for why post-solve metadata can't be used here.
         post_solve_meta = {b["name"]: b for b in figure.bone_metadata()}
 
         def _post_world(name: str) -> tuple[float, float, float]:
             w = post_solve_meta[name]["world_position"]
             return (w["x"], w["y"], w["z"])
 
+        # Hoisted once: every digit below reads the same body-solved
+        # rotations (fingers themselves haven't been touched yet at this
+        # point, so this doesn't change across digits or hands).
+        current_rot = figure.bone_rotations()
+
         finger_errors: dict[str, dict[str, float]] = {}
         all_solved_angles: dict[str, tuple[float, float, float]] = {}
 
-        side_by_label = {"Left": "l", "Right": "r"}
+        # MediaPipe HandLandmarker's handedness label assumes a mirrored
+        # (selfie-style) input image (see hand_landmarks.py's docstring for
+        # the verified citation); pose_transfer_photo.py loads photos
+        # directly via cv2.imread with no mirroring, so the label is
+        # anatomically reversed here -- "Left" is the subject's own right
+        # hand, and vice versa.
+        side_by_label = {"Left": "r", "Right": "l"}
         for hand_label, side in side_by_label.items():
             if hand_label not in detected_hands:
                 print(f"  {hand_label} hand: SKIPPED (not detected)")
                 continue
 
             wrist_bone = f"{side}_hand"
-            wrist_world = _post_world(wrist_bone)
+            wrist_rest_world = _world(wrist_bone)
+            wrist_posed_world = _post_world(wrist_bone)
             anchored = fik.anchor_hand_landmarks(
-                detected_hands[hand_label], mp_hip_mid, daz_hip_world, unit_scale, wrist_world,
+                detected_hands[hand_label], mp_hip_mid, daz_hip_world, unit_scale, wrist_posed_world,
+            )
+
+            # W_hand: the wrist's accumulated world ROTATION after the body
+            # solve (bone_metadata() has no orientation field). Built from
+            # REST metadata + the body-solved angles for this arm's chain, so
+            # it reflects exactly what the body solve did to this wrist,
+            # without re-deriving anything pinocchio_ik.py already computed.
+            wrist_rotation = fik.wrist_world_rotation(
+                list(by_name.values()), _CHAINS[wrist_bone], wrist_bone, current_rot,
             )
 
             for digit_name in ("index", "mid", "ring", "pinky", "thumb"):
                 digit = fik.DIGIT_CHAINS[f"{side}_{digit_name}"]
-                fm = fik.pik.build_figure_model(list(post_solve_meta.values()), digit.chain_bones)
-                current_rot = figure.bone_rotations()
+                # Built from REST metadata (not post_solve_meta): each digit's
+                # root bone (e.g. l_indexmetacarpal) has its real parent
+                # (l_hand) outside this chain's bone set, so
+                # build_figure_model roots it directly to the universe frame
+                # with IDENTITY rotation. That's only exact if the excluded
+                # parent's own world rotation is identity -- true at REST,
+                # false once the body solve has rotated the wrist. Rather
+                # than feed this model posed positions (which would still be
+                # wrong, since the identity-rooting assumption is about
+                # rotation, not position), the model stays in the wrist's
+                # REST frame and the targets are the ones transformed to
+                # match (below).
+                fm = fik.pik.build_figure_model(list(by_name.values()), digit.chain_bones)
                 initial_angles = {
                     b: {"x": current_rot[b][0], "y": current_rot[b][1], "z": current_rot[b][2]}
                     for b in digit.chain_bones
                 }
+                target1 = fik.rotate_target_into_rest_wrist_frame(
+                    anchored[digit.target1_landmark], wrist_rest_world, wrist_posed_world, wrist_rotation,
+                )
+                target2 = fik.rotate_target_into_rest_wrist_frame(
+                    anchored[digit.target2_landmark], wrist_rest_world, wrist_posed_world, wrist_rotation,
+                )
+                tip = fik.rotate_target_into_rest_wrist_frame(
+                    anchored[digit.tip_landmark], wrist_rest_world, wrist_posed_world, wrist_rotation,
+                )
                 solved, err = fik.solve_digit_chain(
                     fm, digit,
-                    target1_point=np.array(anchored[digit.target1_landmark]),
-                    target2_point=np.array(anchored[digit.target2_landmark]),
-                    tip_point=np.array(anchored[digit.tip_landmark]),
+                    target1_point=target1, target2_point=target2, tip_point=tip,
                     initial_angles=initial_angles,
                     max_iterations=args.max_iterations, tolerance=args.tolerance,
                     damping=args.damping, rest_pose_weight=args.rest_pose_weight,
@@ -737,4 +787,7 @@ if __name__ == "__main__":
                 status = "OK" if worst <= args.tolerance else "NOT CONVERGED"
                 print(f"  {name:10s} {worst:.3f}   [{status}]")
 
-    print(f"\nDone. Applied {len(effector_names)} limb targets to {args.figure!r}.")
+    summary = f"\nDone. Applied {len(effector_names)} limb targets to {args.figure!r}."
+    if args.fingers:
+        summary += f" Posed fingers for {len(finger_errors)} digit(s)."
+    print(summary)
