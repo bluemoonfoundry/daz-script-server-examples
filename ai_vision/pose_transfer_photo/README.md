@@ -66,14 +66,17 @@ python pose_transfer_photo.py photo.jpg --debug
 ./run_pinocchio.ps1 --batch photos/ --backend pinocchio \
     --save-poses --render --export-mesh --stats-csv --output-dir batch_output/
 
-    # --expression-image PATH: apply a facial expression extracted from a
-    # separate photo (MediaPipe FaceLandmarker blendshapes -> Genesis 9
-    # facs_bs_*/facs_ctrl_* morphs), holding body pose fixed. Repeatable --
-    # each path produces its own output variant against the SAME solved body
-    # pose. Combine with --batch for a full N-photos x M-expressions grid.
-    python pose_transfer_photo.py photo.jpg \
-        --expression-image smile.jpg --expression-image surprised.jpg \
-        --save-poses --render --output-dir batch_output/
+# --expression-image PATH: apply a facial expression extracted from a
+# separate photo (MediaPipe FaceLandmarker blendshapes -> Genesis 9
+# facs_bs_*/facs_ctrl_* morphs), holding body pose fixed. Repeatable --
+# each path produces its own output variant against the SAME solved body
+# pose. Combine with --batch for a full N-photos x M-expressions grid.
+# --expression-scale FLOAT (default 1.0) is an optional multiplier applied
+# to the extracted blendshape scores before mapping to morphs.
+python pose_transfer_photo.py photo.jpg \
+    --expression-image smile.jpg --expression-image surprised.jpg \
+    --expression-scale 1.2 \
+    --save-poses --render --output-dir batch_output/
 ```
 
 ### Arguments

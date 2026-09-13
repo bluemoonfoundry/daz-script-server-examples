@@ -1051,6 +1051,37 @@ if __name__ == "__main__":
         if unknown:
             sys.exit(f"--camera label(s) not found in scene: {', '.join(map(repr, unknown))}")
 
+    # Extract each unique --expression-image's blendshapes ONCE, up front,
+    # rather than once per (photo x expression) variant below. Extraction
+    # depends only on expr_path, not on the body photo, so re-running it
+    # inside the per-photo loop would re-run MediaPipe FaceLandmarker
+    # inference (a fresh FaceLandmarker construction each time -- see
+    # face_landmarks.py) N times per expression image in an N-photo batch,
+    # for identical results every time. Hoisting also means a bad/faceless
+    # expression image is discovered here, before the first (expensive)
+    # body-pose IK solve runs, instead of after photo 1's solve completes.
+    expression_blendshapes: dict[str, dict[str, float]] = {}
+    expression_failures: dict[str, str] = {}
+    for expr_path in (args.expression_image or []):
+        try:
+            expression_blendshapes[expr_path] = face_landmarks.extract_blendshapes(expr_path)
+        except SystemExit as exc:
+            reason = str(exc.code) if exc.code is not None else "unknown error"
+            if not args.batch:
+                # Single-image run: a bad expression image is a real
+                # configuration error, same severity as a bad body photo in
+                # this mode -- fail fast rather than silently producing zero
+                # output while still exiting 0.
+                sys.exit(f"Error: expression image {expr_path!r} failed: {reason}")
+            print(f"WARNING: expression image {expr_path!r} failed: {reason} -- "
+                  f"every photo's variant using it will be skipped", file=sys.stderr)
+            expression_failures[expr_path] = reason
+        else:
+            unmapped = expression_mapping.warn_unmapped_categories(expression_blendshapes[expr_path])
+            if unmapped:
+                print(f"  Warning: {expr_path!r} has unmapped ARKit categories with signal: {unmapped}",
+                      file=sys.stderr)
+
     results: list[dict] = []
     failures: list[dict] = []
     for i, image_path in enumerate(image_paths, start=1):
@@ -1083,6 +1114,17 @@ if __name__ == "__main__":
         # re-simulating cloth/hair per expression would multiply the already-
         # dominant dForce wall-clock cost with no physical benefit (expression
         # morphs don't move cloth/hair-relevant geometry).
+        #
+        # NOTE: --save-poses now runs after --dforce (previously before, when
+        # this was a single flat per-photo loop with no --expression-image
+        # variants); dForce (DzSimulationMgr.simulate() / DazScene.
+        # run_dforce_simulation(), see dazpy/_dforce.py + dazpy/_scene.py)
+        # simulates cloth/hair dForce-enabled dynamic surfaces via their own
+        # DzDForceModifier -- it never touches the figure's own
+        # bone_rotations()/morph_values() channels. So this reordering does
+        # not change what --save-poses captures for the pre-existing
+        # no-expression-image case: the figure's pose/morph snapshot is
+        # identical whether taken before or after the dForce sim runs.
         if args.dforce:
             print(f"  simulating dForce ({'memorized' if args.dforce_memorize else 'live'} pose)...")
             _call_with_busy_retry(lambda: simulate_dforce(scene, args.dforce_memorize))
@@ -1098,26 +1140,21 @@ if __name__ == "__main__":
             if expr_path is not None:
                 variant_stem = f"{variant_stem}__{_stem(expr_path)}"
                 variant_result["expression"] = expr_path
-                print(f"  Applying expression from {expr_path!r}...")
-                # A face-less expression photo is a per-VARIANT skip -- the
-                # photo's body pose (and any other expression variants for
-                # it) are still valid and should still produce output.
-                try:
-                    blendshapes = face_landmarks.extract_blendshapes(expr_path)
-                except SystemExit as exc:
-                    reason = str(exc.code) if exc.code is not None else "unknown error"
-                    print(f"    SKIPPED: {reason}")
+                # Extraction already happened once, up front, for every
+                # unique expr_path (see above) -- a face-less expression
+                # photo is a per-VARIANT skip here: the photo's body pose
+                # (and any other expression variants for it) are still valid
+                # and should still produce output.
+                if expr_path in expression_failures:
+                    print(f"  SKIPPED expression {expr_path!r}: {expression_failures[expr_path]}")
                     failures.append({
                         "image": image_path, "figure": args.figure,
-                        "reason": f"expression {expr_path!r}: {reason}",
+                        "reason": f"expression {expr_path!r}: {expression_failures[expr_path]}",
                     })
                     continue
-                unmapped = expression_mapping.warn_unmapped_categories(blendshapes)
-                if unmapped:
-                    print(f"    Warning: unmapped ARKit categories with signal: {unmapped}",
-                          file=sys.stderr)
+                print(f"  Applying expression from {expr_path!r}...")
                 with scene.undo("Apply photo expression"):
-                    apply_expression(result["figure_obj"], blendshapes, args.expression_scale)
+                    apply_expression(result["figure_obj"], expression_blendshapes[expr_path], args.expression_scale)
 
             results.append(variant_result)
 
@@ -1138,10 +1175,20 @@ if __name__ == "__main__":
         print(f"\nStats written -> {csv_path}")
 
     if args.batch:
+        # `results` holds one entry per (photo x expression) VARIANT when
+        # --expression-image is set, not one per photo -- a photo with 2
+        # expression variants appears in `results` twice, with an identical
+        # `limb_error` both times (expressions don't touch limb IK). Collapse
+        # back to one entry per distinct photo (keyed by "image") before
+        # computing convergence, so the numerator and denominator both count
+        # photos, not variants.
+        by_photo = {r["image"]: r for r in results}
         converged = sum(
-            1 for r in results if all(e <= args.tolerance for e in r["limb_error"].values())
+            1 for r in by_photo.values() if all(e <= args.tolerance for e in r["limb_error"].values())
         )
-        print(f"\nBatch done: {converged}/{len(results)} converged, "
-              f"{len(results) - converged}/{len(results)} not converged, "
+        total_photos = len(by_photo)
+        variant_note = f", {len(results)} variant(s) total" if args.expression_image else ""
+        print(f"\nBatch done: {converged}/{total_photos} converged, "
+              f"{total_photos - converged}/{total_photos} not converged, "
               f"{len(failures)} skipped (no pose detected/other error), "
-              f"out of {len(image_paths)} total photo(s).")
+              f"out of {len(image_paths)} total photo(s){variant_note}.")
