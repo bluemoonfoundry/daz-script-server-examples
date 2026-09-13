@@ -26,6 +26,24 @@
 # This file pins to what has actually been installed and live-validated
 # against DAZ Studio (see bd daz-script-server-hewu) -- prefer bumping
 # versions deliberately and re-validating over blindly taking newer builds.
+#
+# MKL_NUM_THREADS=1 (see `variables:` below, bd daz-script-server-9825)
+# ----------------------------------------------------------------------
+# This env's numpy links against Intel MKL (conda-forge's default BLAS on
+# Windows), not OpenBLAS. On hybrid P/E-core CPUs (observed on a 13th Gen
+# Core i9), MKL's multithreaded BLAS3/LAPACK routines (dgemm, svd, det, inv
+# -- anything 2-D matrix-matrix, not matrix-vector) crash the interpreter
+# with an illegal-instruction fault and NO Python traceback -- single
+# matrix-vector ops are unaffected. Restricting MKL to one thread avoids it
+# entirely regardless of matrix size; it must be set in the process
+# environment before python.exe starts (setting os.environ from within the
+# script, even before `import numpy`, is too late -- verified empirically).
+# `variables:` here makes `conda env create`/`update` apply it the same way
+# `conda env config vars set MKL_NUM_THREADS=1 -n pinocchio-ik` would, so it
+# always takes effect via `conda activate`/`conda run` (including through
+# run_pinocchio.ps1/.sh). If you ever invoke this env's python.exe by raw
+# path instead (bypassing conda activate/run), set MKL_NUM_THREADS=1 in
+# your shell yourself first -- same PATH/DLL-loading caveat as above.
 name: pinocchio-ik
 channels:
   - conda-forge
@@ -47,3 +65,5 @@ dependencies:
       # this path or drop this line and run `pip install dazpy` instead
       # (a released, non-editable build) after `conda env create`.
       - -e ../../../daz-script-server
+variables:
+  MKL_NUM_THREADS: "1"

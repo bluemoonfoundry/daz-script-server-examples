@@ -45,6 +45,18 @@ already) -- numpy's BLAS DLL lives there, and without it on PATH, plain
 matrix multiplication segfaults the process with no Python traceback at all
 (looks like the interpreter vanished).
 
+IMPORTANT (Windows, hybrid P/E-core CPUs), same symptom, different cause:
+this env's numpy links Intel MKL. MKL's multithreaded BLAS3/LAPACK (dgemm,
+svd, det, inv -- any 2-D matrix-matrix op; matrix-vector is fine) crashes
+with an illegal-instruction fault on hybrid CPUs (observed on a 13th Gen
+Core i9), again with no Python traceback (see bd daz-script-server-9825).
+`environment.yml`'s `variables: MKL_NUM_THREADS: "1"` fixes this for anyone
+going through `conda activate`/`conda run` (including the wrapper scripts).
+Setting it from inside Python (even before `import numpy`) is too late --
+it must be in the process environment before python.exe starts -- so if you
+invoke this env's python.exe by raw path, `export MKL_NUM_THREADS=1` (or
+`$env:MKL_NUM_THREADS = "1"`) in your shell first.
+
 THE FK FORMULA (validated live against DAZ Studio, see bd daz-script-server-hewu)
 -----------------------------------------------------------------------------------
 For a bone with pose channel angles (X, Y, Z degrees) and a given
