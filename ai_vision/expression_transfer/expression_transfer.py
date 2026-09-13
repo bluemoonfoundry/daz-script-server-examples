@@ -52,10 +52,13 @@ ENVIRONMENT SETUP
 
 Usage:
     python expression_transfer.py photo.jpg
-    python expression_transfer.py photo.jpg --figure "Genesis 9"
+    python expression_transfer.py photo.jpg --character "Genesis 9"
     python expression_transfer.py photo.jpg --scale 0.8
     python expression_transfer.py photo.jpg --no-reset
+    python expression_transfer.py photo_sheet.jpg --image-grid
+    python expression_transfer.py photo.jpg --save-duf
     python expression_transfer.py --list-properties
+    python expression_transfer.py --list-characters
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -70,7 +74,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from dazpy import DazClient
+from dazpy import DazClient, DazScene
 
 # ── model setup ────────────────────────────────────────────────────────────────
 # mediapipe >= 0.10 uses the Tasks API and requires a model file.
@@ -80,6 +84,11 @@ _MODEL_URL = (
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 )
 _MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
+
+# Upper bound on faces detected per image when --image-grid is passed. A grid
+# sheet is expected to hold a modest number of headshots; this is generous
+# headroom rather than a tuned limit.
+_MAX_GRID_FACES = 25
 
 
 def _ensure_model() -> str:
@@ -233,6 +242,33 @@ FACS_MAP: dict[str, tuple[str, float]] = {
     "mouth_frown_r":   ("AU 15 Lip Corner Depressor Right",0.9),
 }
 
+# ── naming helpers (for --save-duf) ────────────────────────────────────────────
+
+def au_slug(aus: dict[str, float], threshold: float = 0.15, top_n: int = 2) -> str:
+    """Derive a short filename slug from the dominant active AUs.
+
+    Left/right pairs (e.g. mouth_smile_l / mouth_smile_r) are collapsed to
+    their base name using the stronger side's magnitude. Returns "neutral"
+    if nothing clears the activity threshold.
+    """
+    bases: dict[str, float] = {}
+    for key, value in aus.items():
+        base = key[:-2] if key.endswith(("_l", "_r")) else key
+        bases[base] = max(bases.get(base, 0.0), value)
+
+    active = {base: v for base, v in bases.items() if v > threshold}
+    if not active:
+        return "neutral"
+
+    top = sorted(active.items(), key=lambda kv: -kv[1])[:top_n]
+    return "-".join(name for name, _ in top)
+
+
+def slugify_label(label: str) -> str:
+    """Sanitize a DAZ figure/property label for use in a filename."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "", label.replace(" ", ""))
+
+
 # ── DazScript helpers ──────────────────────────────────────────────────────────
 
 def _skel_lookup(label: str) -> str:
@@ -260,6 +296,16 @@ def list_properties(client: DazClient, figure_label: str) -> list[dict] | None:
         }}
         return out;
     }})()"""
+    return client.execute(script).value
+
+
+def list_characters(client: DazClient) -> list[str]:
+    """Return the labels of all figures (skeletons) currently in the scene."""
+    script = """(function(){
+        var out = [], skels = Scene.getSkeletonList();
+        for (var i = 0; i < skels.length; i++) out.push(skels[i].getLabel());
+        return out;
+    })()"""
     return client.execute(script).value
 
 
@@ -363,11 +409,55 @@ def apply_expression(
 
 # ── image → landmarks ──────────────────────────────────────────────────────────
 
-def extract_landmarks(image_path: str) -> list[tuple[float, float]]:
-    """Decode an image and return 478 pixel-space face landmarks.
+def _face_centroid(lm: list[tuple[float, float]]) -> tuple[float, float]:
+    xs = [p[0] for p in lm]
+    ys = [p[1] for p in lm]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def sort_faces_row_major(
+    faces: list[list[tuple[float, float]]]
+) -> list[list[tuple[float, float]]]:
+    """Order detected faces to match a left-to-right, top-to-bottom grid reading.
+
+    MediaPipe returns multi-face results in no particular spatial order.  For
+    an --image-grid sheet we want "cell 0" to be the top-left photo, matching
+    how a person reads the sheet.  Faces are bucketed into rows using the
+    average detected face height as the row tolerance, then sorted by
+    (row, x) within each bucket.
+    """
+    if len(faces) <= 1:
+        return faces
+
+    heights = [_dist(f[FACE_TOP], f[FACE_BOT]) for f in faces]
+    row_height = (sum(heights) / len(heights)) or 1.0
+
+    def sort_key(face: list[tuple[float, float]]) -> tuple[float, float]:
+        cx, cy = _face_centroid(face)
+        return (round(cy / row_height), cx)
+
+    return sorted(faces, key=sort_key)
+
+
+def extract_landmarks(
+    image_path: str, max_faces: int = 1
+) -> list[list[tuple[float, float]]]:
+    """Decode an image and return pixel-space face landmarks per detected face.
 
     Uses the mediapipe Tasks API (mediapipe >= 0.10).  Downloads the
     face_landmarker.task model file to the same directory on first run.
+
+    Args:
+        image_path: Path to the source image (a single photo, or a grid
+            sheet of multiple photos when max_faces > 1).
+        max_faces: Maximum number of faces to detect. Pass 1 (default) for a
+            single-subject photo; pass a higher value (see --image-grid) to
+            detect every face on a contact-sheet-style image.
+
+    Returns:
+        A list of landmark sets, one per detected face, ordered top-left to
+        bottom-right (see sort_faces_row_major). Each landmark set is a list
+        of 478 (x, y) pixel-space points.
 
     Raises SystemExit if the image cannot be loaded or no face is detected.
     """
@@ -386,7 +476,7 @@ def extract_landmarks(image_path: str) -> list[tuple[float, float]]:
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=_ensure_model()),
         running_mode=RunningMode.IMAGE,
-        num_faces=1,
+        num_faces=max_faces,
     )
 
     with FaceLandmarker.create_from_options(options) as landmarker:
@@ -396,8 +486,8 @@ def extract_landmarks(image_path: str) -> list[tuple[float, float]]:
     if not result.face_landmarks:
         sys.exit("No face detected in image.")
 
-    lms = result.face_landmarks[0]
-    return [(lm.x * w, lm.y * h) for lm in lms]
+    faces = [[(lm.x * w, lm.y * h) for lm in lms] for lms in result.face_landmarks]
+    return sort_faces_row_major(faces)
 
 
 if __name__ == "__main__":
@@ -408,14 +498,22 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("image", nargs="?", help="Path to source image")
-    parser.add_argument("--figure",   default="Genesis 9",
-                        help="DAZ figure label (default: 'Genesis 9')")
+    parser.add_argument("--character", "--figure", dest="figure", default="Genesis 9",
+                        help="DAZ figure label to apply the expression to (default: 'Genesis 9')")
     parser.add_argument("--scale",    type=float, default=1.0,
                         help="Global expression scale factor (default: 1.0)")
     parser.add_argument("--no-reset", dest="reset", action="store_false",
                         help="Blend onto existing expression instead of zeroing first")
+    parser.add_argument("--image-grid", action="store_true",
+                        help="Treat the image as a grid sheet of multiple photos: detect "
+                             "every face and apply each expression in sequence to --character")
+    parser.add_argument("--save-duf", action="store_true",
+                        help="Save a .duf copy of the scene after each expression is applied, "
+                             "named next to the source image")
     parser.add_argument("--list-properties", action="store_true",
                         help="List numeric properties on the figure and exit")
+    parser.add_argument("--list-characters", action="store_true",
+                        help="List figure labels present in the scene and exit")
     parser.add_argument("--search", metavar="TERM",
                         help="Filter --list-properties output (case-insensitive substring)")
     parser.add_argument("--debug", action="store_true",
@@ -423,6 +521,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     client = DazClient()
+
+    if args.list_characters:
+        labels = list_characters(client)
+        print(f"{len(labels)} figure(s) in scene:\n")
+        for label in labels:
+            print(f"  {label!r}")
+        sys.exit(0)
 
     if args.list_properties:
         props = list_properties(client, args.figure)
@@ -439,23 +544,44 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if not args.image:
-        parser.error("image path required (or use --list-properties)")
+        parser.error("image path required (or use --list-properties / --list-characters)")
 
-    landmarks = extract_landmarks(args.image)
-    aus = compute_aus(landmarks)
+    faces = extract_landmarks(args.image, max_faces=_MAX_GRID_FACES if args.image_grid else 1)
+    multi = len(faces) > 1
 
-    print(f"Action units from {args.image!r}:")
-    for k, v in aus.items():
-        bar = "#" * int(v * 20)
-        print(f"  {k:20s}  {v:.3f}  {bar}")
+    scene = DazScene(client) if args.save_duf else None
+    image_dir = os.path.dirname(os.path.abspath(args.image))
+    image_stem = os.path.splitext(os.path.basename(args.image))[0]
+    character_slug = slugify_label(args.figure)
 
-    applied = apply_expression(
-        client, args.figure, aus, scale=args.scale, reset=args.reset, debug=args.debug
-    )
+    for cell, landmarks in enumerate(faces):
+        aus = compute_aus(landmarks)
 
-    active = {label: v for label, v in applied.items() if v > 0.005}
-    print(f"\nApplied {len(active)} active FACS properties to {args.figure!r}:")
-    for label, value in active.items():
-        print(f"  {label}: {value:.3f}")
-    if not active:
-        print("  (no active properties — try a more expressive photo or increase --scale)")
+        header = f"Action units from {args.image!r}" + (f" (cell {cell}):" if multi else ":")
+        print(header)
+        for k, v in aus.items():
+            bar = "#" * int(v * 20)
+            print(f"  {k:20s}  {v:.3f}  {bar}")
+
+        applied = apply_expression(
+            client, args.figure, aus, scale=args.scale, reset=args.reset, debug=args.debug
+        )
+
+        active = {label: v for label, v in applied.items() if v > 0.005}
+        print(f"\nApplied {len(active)} active FACS properties to {args.figure!r}:")
+        for label, value in active.items():
+            print(f"  {label}: {value:.3f}")
+        if not active:
+            print("  (no active properties — try a more expressive photo or increase --scale)")
+
+        if args.save_duf:
+            name_parts = [image_stem]
+            if multi:
+                name_parts.append(f"cell{cell}")
+            name_parts.append(au_slug(aus))
+            name_parts.append(character_slug)
+            dest = os.path.join(image_dir, "_".join(name_parts) + ".duf")
+            result = scene.save_copy(dest)
+            print(f"Saved .duf: {result.get('path', dest)}")
+
+        print()
