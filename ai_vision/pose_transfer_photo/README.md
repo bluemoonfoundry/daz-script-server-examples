@@ -14,6 +14,7 @@ Extracts a body pose from a photo using MediaPipe PoseLandmarker, then drives a 
 - Adding a null-space secondary objective (rest-pose bias) to a damped-least-squares IK solve using numpy
 - Auto-calibrating a photo's scale/origin against a live figure's own rest-pose measurements
 - Wrapping a multi-limb pose application in one undo step
+- Mapping MediaPipe FaceLandmarker's ARKit-style blendshape output onto a different rig's own morph vocabulary (Genesis 9's facs_bs_* set splits several bilateral ARKit categories into separate Left/Right and/or Upper/Lower morphs) via a small static lookup table, rather than assuming the two naming schemes line up 1:1
 
 ## Prerequisites
 
@@ -64,6 +65,15 @@ python pose_transfer_photo.py photo.jpg --debug
 # above). Any combination of the four output flags is allowed.
 ./run_pinocchio.ps1 --batch photos/ --backend pinocchio \
     --save-poses --render --export-mesh --stats-csv --output-dir batch_output/
+
+    # --expression-image PATH: apply a facial expression extracted from a
+    # separate photo (MediaPipe FaceLandmarker blendshapes -> Genesis 9
+    # facs_bs_*/facs_ctrl_* morphs), holding body pose fixed. Repeatable --
+    # each path produces its own output variant against the SAME solved body
+    # pose. Combine with --batch for a full N-photos x M-expressions grid.
+    python pose_transfer_photo.py photo.jpg \
+        --expression-image smile.jpg --expression-image surprised.jpg \
+        --save-poses --render --output-dir batch_output/
 ```
 
 ### Arguments
