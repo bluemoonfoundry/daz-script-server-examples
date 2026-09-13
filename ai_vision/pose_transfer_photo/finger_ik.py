@@ -202,24 +202,87 @@ def rotate_target_into_rest_wrist_frame(
     )
 
 
+def _right_handed_frame(v1: np.ndarray, v2: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Right-handed orthonormal basis (e1, e2, e3) with e1 along `v1` and e3
+    normal to the `v1`/`v2` plane -- built from cross/dot/norm only (no
+    matrix-matrix multiply), per `kabsch_rotation`'s environment constraint.
+    """
+    e1 = v1 / np.linalg.norm(v1)
+    e3 = np.cross(v1, v2)
+    e3 = e3 / np.linalg.norm(e3)
+    e2 = np.cross(e3, e1)
+    return e1, e2, e3
+
+
+def kabsch_rotation(source_vectors: np.ndarray, target_vectors: np.ndarray) -> np.ndarray:
+    """Proper rotation `R` mapping the orthonormal frame spanned by
+    `source_vectors[0]`/`source_vectors[1]` exactly onto the frame spanned
+    by `target_vectors[0]`/`target_vectors[1]` -- a rigid rotation fit from
+    a two-vector correspondence (this project's Kabsch/Procrustes use case:
+    aligning a WRIST/INDEX_MCP/PINKY_MCP triangle, see
+    `anchor_hand_landmarks`), built as `R = sum_k outer(target_k, source_k)`
+    over each frame's three basis vectors -- exact for an orthonormal
+    source basis, since `R @ source_k = target_k` for each `k`.
+
+    Deliberately avoids `numpy.linalg.svd`/`det`/`inv`/`eigh` and any 2-D
+    `@`/`np.dot`/`np.matmul` (matrix-matrix multiply): all of those reliably
+    crash with an illegal-instruction fault on this project's numpy/
+    OpenBLAS build on this machine (a dgemm/LAPACK BLAS3 bug -- confirmed
+    even for `np.eye(3) @ np.eye(3)` in isolation, see bd
+    daz-script-server-ap3l), while matrix-vector products, `np.dot` on 1-D
+    vectors, `np.cross`, and `np.outer` are all BLAS1/2 operations and are
+    unaffected. This is an exact frame-to-frame rotation rather than a
+    least-squares fit over noisy many-point data, which is fine here since
+    there are only ever two correspondence vectors.
+    """
+    s1, s2, s3 = _right_handed_frame(source_vectors[0], source_vectors[1])
+    t1, t2, t3 = _right_handed_frame(target_vectors[0], target_vectors[1])
+    return np.outer(t1, s1) + np.outer(t2, s2) + np.outer(t3, s3)
+
+
 def anchor_hand_landmarks(
     hand_landmarks: list[tuple[float, float, float]],
     mp_hip_mid: tuple[float, float, float],
     daz_hip_world: tuple[float, float, float],
     unit_scale: float,
     wrist_world: tuple[float, float, float],
+    rest_wrist_world: tuple[float, float, float],
+    rest_index_mcp_world: tuple[float, float, float],
+    rest_pinky_mcp_world: tuple[float, float, float],
 ) -> list[np.ndarray]:
     """Apply the body pipeline's existing scale+rotation transform to a
-    hand's 21 landmarks, then translate the whole set so its own wrist
-    landmark lands exactly on `wrist_world` (the already-solved l_hand/
-    r_hand world position). Per the design spec: this assumes MediaPipe's
-    Pose and Hand world-landmark tasks share a rotational axis convention
-    (verified live in Task 6, not re-derived here) -- a pure translation,
-    no separate rotation estimate.
+    hand's 21 landmarks, then a per-hand Kabsch/Procrustes rotation about
+    the wrist, then translate the whole set so its own wrist landmark lands
+    exactly on `wrist_world` (the already-solved l_hand/r_hand world
+    position).
+
+    The design spec originally assumed MediaPipe's Pose and Hand
+    world-landmark tasks share a rotational axis convention -- a pure
+    translation, no rotation estimate. Live validation (bd
+    daz-script-server-ap3l) falsified that: fingers were driven to the
+    wrong (hyperextension) end of their joint-limit range. Per the spec's
+    own fallback plan, the extra rotation is fit from the stable
+    WRIST/INDEX_MCP/PINKY_MCP triangle -- aligning the transformed
+    landmarks' own wrist-relative geometry onto the DAZ rig's REST-pose
+    geometry for the corresponding bones (`{side}_hand`/`{side}_index1`/
+    `{side}_pinky1` -- a bone's `world_position` is its own proximal joint,
+    which is exactly the MCP joint for `index1`/`pinky1`).
     """
     transformed = [
         np.array(to_daz_world(lm, mp_hip_mid, daz_hip_world, unit_scale))
         for lm in hand_landmarks
     ]
-    offset = np.array(wrist_world) - transformed[0]
-    return [p + offset for p in transformed]
+    wrist_t = transformed[WRIST]
+
+    source_vectors = np.array([
+        transformed[INDEX_MCP] - wrist_t,
+        transformed[PINKY_MCP] - wrist_t,
+    ])
+    target_vectors = np.array([
+        np.array(rest_index_mcp_world) - np.array(rest_wrist_world),
+        np.array(rest_pinky_mcp_world) - np.array(rest_wrist_world),
+    ])
+    R = kabsch_rotation(source_vectors, target_vectors)
+
+    wrist_world_arr = np.array(wrist_world)
+    return [wrist_world_arr + R @ (p - wrist_t) for p in transformed]

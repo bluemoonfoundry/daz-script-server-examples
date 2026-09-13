@@ -281,29 +281,129 @@ def test_naive_digit_solve_is_wrong_under_rotated_wrist_but_frame_correction_fix
     assert fixed_real_error < naive_real_error / 10.0
 
 
+def _fake_hand_landmarks(index_mcp=(0.02, -0.01, 0.0), pinky_mcp=(0.03, 0.015, 0.005), extra=None):
+    """21-entry fake landmark list (MediaPipe HandLandmarker shape) with only
+    WRIST(0)/INDEX_MCP(5)/PINKY_MCP(17) set to meaningful values -- the rest
+    zeroed, since `anchor_hand_landmarks` only uses those three plus whatever
+    `extra` overrides for a given test.
+    """
+    landmarks = [(0.0, 0.0, 0.0)] * 21
+    landmarks[fik.WRIST] = (0.0, 0.0, 0.0)
+    landmarks[fik.INDEX_MCP] = index_mcp
+    landmarks[fik.PINKY_MCP] = pinky_mcp
+    if extra:
+        for i, v in extra.items():
+            landmarks[i] = v
+    return landmarks
+
+
+def _identity_rest_geometry(hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale):
+    """REST rig geometry that exactly matches this fake hand's own
+    transformed WRIST/INDEX_MCP/PINKY_MCP triangle, so `kabsch_rotation`
+    recovers the identity rotation -- isolates these tests to the
+    translation behavior, unaffected by the new rotation-correction step.
+    """
+    wrist_t = np.array(to_daz_world(hand_landmarks[fik.WRIST], mp_hip_mid, daz_hip_world, unit_scale))
+    index_t = np.array(to_daz_world(hand_landmarks[fik.INDEX_MCP], mp_hip_mid, daz_hip_world, unit_scale))
+    pinky_t = np.array(to_daz_world(hand_landmarks[fik.PINKY_MCP], mp_hip_mid, daz_hip_world, unit_scale))
+    return tuple(wrist_t), tuple(index_t), tuple(pinky_t)
+
+
 def test_anchor_hand_landmarks_places_wrist_exactly_at_given_position():
-    hand_landmarks = [(0.0, 0.0, 0.0), (0.02, -0.01, 0.0), (0.04, -0.02, 0.0)]  # fake, only need [0]
+    hand_landmarks = _fake_hand_landmarks()
     mp_hip_mid = (0.1, 0.2, 0.3)
     daz_hip_world = (5.0, 90.0, -2.0)
     unit_scale = 100.0
     wrist_world = (10.0, 95.0, 3.0)
+    rest_wrist, rest_index, rest_pinky = _identity_rest_geometry(
+        hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale,
+    )
 
-    anchored = fik.anchor_hand_landmarks(hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world)
+    anchored = fik.anchor_hand_landmarks(
+        hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world,
+        rest_wrist, rest_index, rest_pinky,
+    )
 
     np.testing.assert_allclose(anchored[0], np.array(wrist_world), atol=1e-9)
-    assert len(anchored) == 3
+    assert len(anchored) == 21
 
 
 def test_anchor_hand_landmarks_preserves_relative_scaled_offsets():
-    hand_landmarks = [(0.0, 0.0, 0.0), (0.02, 0.0, 0.0)]
+    hand_landmarks = _fake_hand_landmarks(extra={1: (0.02, 0.0, 0.0)})
     mp_hip_mid = (0.0, 0.0, 0.0)
     daz_hip_world = (0.0, 0.0, 0.0)
     unit_scale = 100.0
     wrist_world = (0.0, 0.0, 0.0)
+    rest_wrist, rest_index, rest_pinky = _identity_rest_geometry(
+        hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale,
+    )
 
-    anchored = fik.anchor_hand_landmarks(hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world)
+    anchored = fik.anchor_hand_landmarks(
+        hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world,
+        rest_wrist, rest_index, rest_pinky,
+    )
 
     # landmark[1] is +0.02 in x relative to landmark[0] (the wrist) in
     # MediaPipe space; to_daz_world's x sign is unflipped and unit_scale=100
     # -> expect +2.0 in DAZ x relative to the anchored wrist.
     np.testing.assert_allclose(anchored[1] - anchored[0], np.array([2.0, 0.0, 0.0]), atol=1e-9)
+
+
+def test_kabsch_rotation_recovers_known_rotation():
+    # NOTE: assertions here deliberately avoid np.linalg.det/svd/inv and any
+    # 2-D `@` (matrix-matrix multiply) -- all of those crash with an
+    # illegal-instruction fault on this project's numpy/OpenBLAS build on
+    # this machine (see kabsch_rotation's docstring, bd daz-script-server-ap3l).
+    # Matrix-vector products, np.dot on 1-D vectors, and np.cross are unaffected.
+    source_vectors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    R_true = pik._axis_rotation("Z", 37.0)
+    target_vectors = np.array([R_true @ v for v in source_vectors])
+
+    R = fik.kabsch_rotation(source_vectors, target_vectors)
+
+    np.testing.assert_allclose(R, R_true, atol=1e-9)
+    # Recovered R must be a proper rotation (orthonormal columns, det=+1),
+    # not a reflection -- checked via cross/dot instead of det()/R@R.T.
+    columns = [R[:, i] for i in range(3)]
+    for c in columns:
+        assert np.linalg.norm(c) == pytest.approx(1.0, abs=1e-9)
+    assert np.dot(columns[0], columns[1]) == pytest.approx(0.0, abs=1e-9)
+    assert np.dot(columns[0], columns[2]) == pytest.approx(0.0, abs=1e-9)
+    triple_product = np.dot(columns[0], np.cross(columns[1], columns[2]))
+    assert triple_product == pytest.approx(1.0, abs=1e-9)
+
+
+def test_anchor_hand_landmarks_corrects_wrong_handed_orientation():
+    # Rig's REST geometry: index/pinky MCPs spread out along +x/-x from the
+    # wrist (a plausible flat-hand rest pose).
+    rest_wrist = (0.0, 90.0, 0.0)
+    rest_index = (2.0, 90.0, 0.0)
+    rest_pinky = (-2.0, 90.0, -0.5)
+
+    # Fake MediaPipe hand whose transformed WRIST/INDEX_MCP/PINKY_MCP
+    # triangle is the REST triangle rotated 90 degrees about z -- the same
+    # "wrong-handed" shape the live validation found (fingers landing on
+    # the wrong side of the wrist relative to the rig's own geometry).
+    R_wrong = pik._axis_rotation("Z", 90.0)
+    mp_hip_mid = (0.0, 0.0, 0.0)
+    daz_hip_world = (0.0, 90.0, 0.0)
+    unit_scale = 1.0
+    index_mp = R_wrong @ (np.array(rest_index) - np.array(rest_wrist))
+    pinky_mp = R_wrong @ (np.array(rest_pinky) - np.array(rest_wrist))
+    hand_landmarks = _fake_hand_landmarks(index_mcp=tuple(index_mp), pinky_mcp=tuple(pinky_mp))
+
+    wrist_world = (10.0, 95.0, 3.0)
+    anchored = fik.anchor_hand_landmarks(
+        hand_landmarks, mp_hip_mid, daz_hip_world, unit_scale, wrist_world,
+        rest_wrist, rest_index, rest_pinky,
+    )
+
+    # After correction, the anchored INDEX_MCP/PINKY_MCP should sit in the
+    # same *direction* from the anchored wrist as the rig's own REST
+    # geometry -- the 90-degree misalignment must be undone, not baked in.
+    wrist_anchored = anchored[fik.WRIST]
+    index_dir = (anchored[fik.INDEX_MCP] - wrist_anchored)
+    index_dir /= np.linalg.norm(index_dir)
+    expected_dir = (np.array(rest_index) - np.array(rest_wrist))
+    expected_dir /= np.linalg.norm(expected_dir)
+    np.testing.assert_allclose(index_dir, expected_dir, atol=1e-6)

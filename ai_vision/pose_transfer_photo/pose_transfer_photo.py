@@ -688,6 +688,7 @@ def process_photo(image_path: str, figure_label: str, scene: "DazScene", client:
             wrist_posed_world = _post_world(wrist_bone)
             anchored = fik.anchor_hand_landmarks(
                 detected_hands[hand_label], mp_hip_mid, daz_hip_world, unit_scale, wrist_posed_world,
+                wrist_rest_world, _world(f"{side}_index1"), _world(f"{side}_pinky1"),
             )
 
             # W_hand: the wrist's accumulated world ROTATION after the body
