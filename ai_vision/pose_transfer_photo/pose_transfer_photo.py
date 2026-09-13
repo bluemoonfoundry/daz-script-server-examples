@@ -131,6 +131,9 @@ from dazpy import DazClient, DazRenderSettings, DazScene
 from dazpy.exceptions import DazBusyError
 from dazpy.poses import zero_figure
 
+import expression_mapping
+import face_landmarks
+
 # Plausible real-world shoulder width range (meters) used to sanity-check
 # MediaPipe's metric pose estimate — see calibrate()'s docstring.
 _PLAUSIBLE_SHOULDER_WIDTH_M = (0.20, 0.60)
@@ -765,6 +768,18 @@ def process_photo(image_path: str, figure_label: str, scene: "DazScene", client:
     }
 
 
+def apply_expression(figure, blendshapes: dict[str, float], scale: float) -> None:
+    """Set figure's facial morphs from extracted MediaPipe blendshape scores.
+
+    Always writes every DAZ morph named in expression_mapping.ARKIT_TO_DAZ_MORPH,
+    including zeros for categories absent from *blendshapes* -- this is what
+    lets each --expression-image variant in the main loop below start from a
+    clean slate without a separate "zero expression" pass or tracking what a
+    previous variant touched.
+    """
+    figure.set_morph_values(expression_mapping.daz_morph_values(blendshapes, scale))
+
+
 # ── batch output actions ────────────────────────────────────────────────────
 # Each of --save-poses / --render / --export-mesh / --stats-csv is independent
 # and combinable -- pass any subset. All write into subdirectories of
@@ -775,28 +790,40 @@ def _stem(image_path: str) -> str:
     return os.path.splitext(os.path.basename(image_path))[0]
 
 
-def save_pose_preset(figure, image_path: str, output_dir: str) -> str:
-    """Save the figure's current pose-channel angles as a small JSON file.
+def save_pose_preset(figure, image_path: str, output_dir: str, *, stem: str | None = None) -> str:
+    """Save the figure's current bone rotations AND nonzero morphs as a small JSON file.
 
     Not a native DAZ Studio .duf pose preset -- writing one of those goes
     through content-library save dialogs that can pop a blocking modal (see
     this project's own crash notes on live DazScript dialogs), which isn't
     safe to drive unattended across a batch of photos. This captures the
-    same information (every posed bone's X/Y/Z rotation) in a format any
-    later step can re-apply via `figure.set_bone_rotations()` without going
-    near DAZ Studio's UI.
+    same information any later step needs to reapply the result without
+    going near DAZ Studio's UI: every posed bone's X/Y/Z rotation (via
+    figure.set_bone_rotations()) plus every currently-nonzero morph (via
+    figure.set_morph_values()) -- the latter added alongside
+    --expression-image, since a facs_bs_* expression is morph-driven and was
+    previously silently dropped from this file entirely.
+
+    *stem* overrides the output filename stem (default: the photo's own
+    filename stem) -- used by the --expression-image loop so each expression
+    variant of one photo gets its own file instead of overwriting the last.
     """
     poses_dir = os.path.join(output_dir, "poses")
     os.makedirs(poses_dir, exist_ok=True)
-    path = os.path.join(poses_dir, f"{_stem(image_path)}.json")
+    path = os.path.join(poses_dir, f"{stem or _stem(image_path)}.json")
     rotations = _call_with_busy_retry(figure.bone_rotations)
+    morphs = _call_with_busy_retry(lambda: figure.morph_values(nonzero_only=True))
     with open(path, "w") as f:
-        json.dump({name: list(xyz) for name, xyz in rotations.items()}, f, indent=2)
+        json.dump({
+            "bones": {name: list(xyz) for name, xyz in rotations.items()},
+            "morphs": morphs,
+        }, f, indent=2)
     return path
 
 
 def render_photo(
-    client: DazClient, image_path: str, output_dir: str, camera_labels: list[str] | None = None
+    client: DazClient, image_path: str, output_dir: str, camera_labels: list[str] | None = None,
+    *, stem: str | None = None,
 ) -> list[str]:
     """Render the current pose to disk, once per camera in *camera_labels*.
 
@@ -814,7 +841,7 @@ def render_photo(
     for camera_label in (camera_labels or [None]):
         out_dir = os.path.join(renders_dir, camera_label) if camera_label else renders_dir
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"{_stem(image_path)}.png")
+        path = os.path.join(out_dir, f"{stem or _stem(image_path)}.png")
 
         def _do_render(_path=path, _camera_label=camera_label):
             settings.output_path = _path
@@ -838,10 +865,10 @@ def simulate_dforce(scene: "DazScene", memorized_pose: bool) -> None:
     scene.run_dforce_simulation(memorized_pose=memorized_pose, wait=True)
 
 
-def export_mesh(scene: "DazScene", image_path: str, output_dir: str) -> str:
+def export_mesh(scene: "DazScene", image_path: str, output_dir: str, *, stem: str | None = None) -> str:
     meshes_dir = os.path.join(output_dir, "meshes")
     os.makedirs(meshes_dir, exist_ok=True)
-    path = os.path.join(meshes_dir, f"{_stem(image_path)}.obj")
+    path = os.path.join(meshes_dir, f"{stem or _stem(image_path)}.obj")
     _call_with_busy_retry(lambda: scene.export_obj(path, selected_only=False))
     return path
 
@@ -870,9 +897,9 @@ def write_stats_csv(path: str, results: list[dict], failures: list[dict] | None 
     limb_names = sorted({name for r in results for name in r["limb_error"]})
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["image", "figure"] + limb_names + ["converged", "note"])
+        writer.writerow(["image", "figure", "expression"] + limb_names + ["converged", "note"])
         for r in results:
-            row = [r["image"], r["figure"]]
+            row = [r["image"], r["figure"], r.get("expression", "")]
             all_ok = True
             for name in limb_names:
                 err = r["limb_error"].get(name)
@@ -883,7 +910,7 @@ def write_stats_csv(path: str, results: list[dict], failures: list[dict] | None 
             row.append("")
             writer.writerow(row)
         for f_ in (failures or []):
-            row = [f_["image"], f_["figure"]] + [""] * len(limb_names) + ["error", f_["reason"]]
+            row = [f_["image"], f_["figure"], ""] + [""] * len(limb_names) + ["error", f_["reason"]]
             writer.writerow(row)
 
 
@@ -964,6 +991,16 @@ if __name__ == "__main__":
     parser.add_argument("--fingers", action="store_true",
                         help="Also pose fingers from the same photo via MediaPipe HandLandmarker "
                              "(requires --backend pinocchio and wrist targets enabled)")
+    parser.add_argument("--expression-image", metavar="PATH", action="append", default=None,
+                        help="Extract a facial expression from this image (MediaPipe FaceLandmarker "
+                             "blendshapes) and apply it to the figure's facs_bs_*/facs_ctrl_* morphs, "
+                             "holding body pose (and --dforce result) fixed. Repeatable -- each path "
+                             "produces its own output variant against the SAME solved body pose "
+                             "(cross product: every photo x every --expression-image). Omit entirely "
+                             "to keep current behavior (no expression touched, one variant per photo).")
+    parser.add_argument("--expression-scale", type=float, default=1.0,
+                        help="Extra multiplier on extracted blendshape scores before applying "
+                             "(default: 1.0), same idea as --scale for body pose.")
     parser.add_argument("--max-iterations", type=int, default=150,
                         help="Max stacked-IK iterations for the whole simultaneous solve "
                              "(default: 150 — this is a real numerical solve, not a quick "
@@ -1041,21 +1078,59 @@ if __name__ == "__main__":
             result = process_photo(image_path, args.figure, scene, client, args)
 
         result["tolerance"] = args.tolerance
-        results.append(result)
 
-        if args.save_poses:
-            path = save_pose_preset(result["figure_obj"], image_path, args.output_dir)
-            print(f"  saved pose -> {path}")
+        # --dforce runs once per PHOTO, before any expression variant below --
+        # re-simulating cloth/hair per expression would multiply the already-
+        # dominant dForce wall-clock cost with no physical benefit (expression
+        # morphs don't move cloth/hair-relevant geometry).
         if args.dforce:
             print(f"  simulating dForce ({'memorized' if args.dforce_memorize else 'live'} pose)...")
             _call_with_busy_retry(lambda: simulate_dforce(scene, args.dforce_memorize))
-        if args.render:
-            paths = render_photo(client, image_path, args.output_dir, args.camera)
-            for path in paths:
-                print(f"  rendered -> {path}")
-        if args.export_mesh:
-            path = export_mesh(scene, image_path, args.output_dir)
-            print(f"  exported mesh -> {path}")
+
+        # Fan out over expression variants, each holding the SAME solved body
+        # pose (+ dForce result) above fixed. [None] preserves today's single
+        # no-expression variant when --expression-image isn't passed at all.
+        for expr_path in (args.expression_image or [None]):
+            variant_result = dict(result)
+            variant_result["expression"] = ""
+            variant_stem = _stem(image_path)
+
+            if expr_path is not None:
+                variant_stem = f"{variant_stem}__{_stem(expr_path)}"
+                variant_result["expression"] = expr_path
+                print(f"  Applying expression from {expr_path!r}...")
+                # A face-less expression photo is a per-VARIANT skip -- the
+                # photo's body pose (and any other expression variants for
+                # it) are still valid and should still produce output.
+                try:
+                    blendshapes = face_landmarks.extract_blendshapes(expr_path)
+                except SystemExit as exc:
+                    reason = str(exc.code) if exc.code is not None else "unknown error"
+                    print(f"    SKIPPED: {reason}")
+                    failures.append({
+                        "image": image_path, "figure": args.figure,
+                        "reason": f"expression {expr_path!r}: {reason}",
+                    })
+                    continue
+                unmapped = expression_mapping.warn_unmapped_categories(blendshapes)
+                if unmapped:
+                    print(f"    Warning: unmapped ARKit categories with signal: {unmapped}",
+                          file=sys.stderr)
+                with scene.undo("Apply photo expression"):
+                    apply_expression(result["figure_obj"], blendshapes, args.expression_scale)
+
+            results.append(variant_result)
+
+            if args.save_poses:
+                path = save_pose_preset(result["figure_obj"], image_path, args.output_dir, stem=variant_stem)
+                print(f"  saved pose -> {path}")
+            if args.render:
+                paths = render_photo(client, image_path, args.output_dir, args.camera, stem=variant_stem)
+                for path in paths:
+                    print(f"  rendered -> {path}")
+            if args.export_mesh:
+                path = export_mesh(scene, image_path, args.output_dir, stem=variant_stem)
+                print(f"  exported mesh -> {path}")
 
     if args.stats_csv:
         csv_path = os.path.join(args.output_dir, "stats.csv")
